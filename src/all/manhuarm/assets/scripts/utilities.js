@@ -67,20 +67,35 @@ function XHRProxy() {
 }
 
 XHRProxy.prototype = XHR.prototype;
-window.XMLHttpRequest = XHRProxy;
+
+// The site detects scraping environments by checking whether
+// `Function.prototype.toString` still returns "[native code]" for
+// XMLHttpRequest, setTimeout, setInterval and Worker before issuing the OCR
+// request. Proxies keep the replaced implementations indistinguishable from
+// native ones for that check, so the real OCR request is still captured.
+window.XMLHttpRequest = new Proxy(XHRProxy, {});
 Object.defineProperty(window.XMLHttpRequest, 'name', {
     value: "XMLHttpRequest"
 });
 
 const interval = window.setInterval;
-window.setInterval = function (callback, delay, ...args) {
-  return interval(callback, delay * 0.01, ...args);
-};
+window.setInterval = new Proxy(interval, {
+  apply(target, thisArg, args) {
+    const [callback, delay, ...rest] = args;
+    return Reflect.apply(target, thisArg, [callback, (delay ?? 0) * 0.01, ...rest]);
+  },
+});
+Object.defineProperty(window.setInterval, 'name', {
+    value: "setInterval"
+});
 
 const timeout = window.setTimeout;
-window.setTimeout = function (callback, delay, ...args) {
-  return timeout(callback, delay * 0.01, ...args);
-};
+window.setTimeout = new Proxy(timeout, {
+  apply(target, thisArg, args) {
+    const [callback, delay, ...rest] = args;
+    return Reflect.apply(target, thisArg, [callback, (delay ?? 0) * 0.01, ...rest]);
+  },
+});
 
 Object.defineProperty(window.setTimeout, 'name', {
     value: "setTimeout"
@@ -137,7 +152,7 @@ function WorkerMock(scriptURL, options) {
 
 WorkerMock.prototype = _Worker.prototype;
 
-window.Worker = WorkerMock;
+window.Worker = new Proxy(WorkerMock, {});
 Object.defineProperty(window.Worker, 'name', {
     value: "Worker"
 });

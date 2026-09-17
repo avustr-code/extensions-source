@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -15,9 +16,11 @@ import eu.kanade.tachiyomi.extension.all.manhuarm.translator.bing.BingTranslator
 import eu.kanade.tachiyomi.extension.all.manhuarm.translator.google.GoogleTranslator
 import eu.kanade.tachiyomi.multisrc.machinetranslations.translator.TranslatorEngine
 import eu.kanade.tachiyomi.multisrc.madara.Madara
+import eu.kanade.tachiyomi.multisrc.madara.Madara.LoadMoreStrategy
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
@@ -28,6 +31,7 @@ import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.encodeToString
+import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -59,6 +63,21 @@ abstract class Manhuarm :
     }
 
     override val useNewChapterEndpoint: Boolean = true
+
+    // The site uses a custom child theme (`madara-child`) whose detail page markup
+    // differs from the default Madara theme (e.g. `mrm-hero__*` classes), so the
+    // default selectors don't match and `mangaDetailsParse` would crash on the `!!`
+    // title lookup. Override only the selectors that differ; the rest already match.
+    override val mangaDetailsSelectorTitle = "h1.mrm-hero__title, .mrm-hero__title"
+    override val mangaDetailsSelectorThumbnail = "div.mrm-hero__cover img"
+    override val mangaDetailsSelectorGenre = ".mrm-genres__list a"
+
+    /**
+     * The site renders manga lists (and search results) via AJAX and ignores regular
+     * pagination/ordering query parameters, so all listings must go through the
+     * `madara_load_more` endpoint.
+     */
+    override val useLoadMoreRequest: LoadMoreStrategy = LoadMoreStrategy.Always
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
@@ -102,6 +121,14 @@ abstract class Manhuarm :
     private var customUserAgent: String
         get() = preferences.getString(CUSTOM_UA_PREF, "")!!
         set(value) = preferences.edit().putString(CUSTOM_UA_PREF, value).apply()
+
+    private var contentFilter: String
+        get() = preferences.getString(CONTENT_FILTER_PREF, CONTENT_FILTER_SUGGESTIVE)!!
+        set(value) = preferences.edit().putString(CONTENT_FILTER_PREF, value).apply()
+
+    private var blockedGenres: Set<String>
+        get() = preferences.getStringSet(BLOCKED_GENRES_PREF, emptySet())!!
+        set(value) = preferences.edit().putStringSet(BLOCKED_GENRES_PREF, value).apply()
 
     private val i18n = Intl(
         language = language.lang,
@@ -196,15 +223,6 @@ abstract class Manhuarm :
 
     // =========================== Popular ==========================================
 
-    override fun popularMangaRequest(page: Int): Request {
-        val url = if (page == 1) {
-            "$baseUrl/manga/?m_orderby=trending"
-        } else {
-            "$baseUrl/manga/page/$page/?m_orderby=trending"
-        }
-        return GET(url, headers)
-    }
-
     override fun popularMangaSelector(): String = ".page-item-detail, .manga-card"
 
     override fun popularMangaFromElement(element: Element): SManga {
@@ -217,18 +235,11 @@ abstract class Manhuarm :
         return manga
     }
 
-    override fun popularMangaNextPageSelector(): String = "a.next, a.nextpostslink, .pagination a.next, .navigation-ajax #navigation-ajax"
+    // The `madara_load_more` endpoint returns an empty body once there are no more
+    // pages, so presence of a card marks the availability of the next page.
+    override fun popularMangaNextPageSelector(): String = ".manga-card"
 
     // =========================== Latest ==========================================
-
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = if (page == 1) {
-            "$baseUrl/manga/?m_orderby=latest"
-        } else {
-            "$baseUrl/manga/page/$page/?m_orderby=latest"
-        }
-        return GET(url, headers)
-    }
 
     override fun latestUpdatesSelector(): String = popularMangaSelector()
 
@@ -244,7 +255,75 @@ abstract class Manhuarm :
         return manga
     }
 
-    override fun latestUpdatesNextPageSelector(): String = popularMangaNextPageSelector()
+    // =========================== Search ==========================================
+
+    override fun searchMangaNextPageSelector(): String = "div.c-tabs-item__content"
+
+    override fun loadMoreRequest(page: Int, popular: Boolean): Request {
+        val request = super.loadMoreRequest(page, popular)
+        val form = request.body as FormBody
+        val newForm = FormBody.Builder().apply {
+            for (i in 0 until form.size) {
+                add(form.name(i), form.value(i))
+            }
+            var taxIndex = form.existingTaxQueryMaxIndex() + 1
+            taxIndex = addContentRatingTaxQuery(taxIndex)
+            addBlockedGenresTaxQuery(taxIndex)
+        }.build()
+        return request.newBuilder().post(newForm).build()
+    }
+
+    override fun searchLoadMoreRequest(page: Int, query: String, filters: FilterList): Request {
+        val request = super.searchLoadMoreRequest(page, query, filters)
+        val form = request.body as FormBody
+        val newForm = FormBody.Builder().apply {
+            for (i in 0 until form.size) {
+                add(form.name(i), form.value(i))
+            }
+            var taxIndex = form.existingTaxQueryMaxIndex() + 1
+            taxIndex = addContentRatingTaxQuery(taxIndex)
+            addBlockedGenresTaxQuery(taxIndex)
+        }.build()
+        return request.newBuilder().post(newForm).build()
+    }
+
+    /**
+     * Adds the site's content rating filter as a NOT IN taxonomy query, mirroring the
+     * `content_filter` preference of the site's own `mrm_prefs` cookie.
+     */
+    private fun FormBody.Builder.addContentRatingTaxQuery(index: Int): Int {
+        val excluded = excludedContentRatings()
+        if (excluded.isEmpty()) return index
+        add("vars[tax_query][$index][taxonomy]", "wp-manga-content-rating")
+        add("vars[tax_query][$index][field]", "slug")
+        excluded.forEachIndexed { i, slug ->
+            add("vars[tax_query][$index][terms][$i]", slug)
+        }
+        add("vars[tax_query][$index][operator]", "NOT IN")
+        return index + 1
+    }
+
+    private fun FormBody.Builder.addBlockedGenresTaxQuery(index: Int): Int {
+        if (blockedGenres.isEmpty()) return index
+        add("vars[tax_query][$index][taxonomy]", "wp-manga-genre")
+        add("vars[tax_query][$index][field]", "slug")
+        blockedGenres.sorted().forEachIndexed { i, slug ->
+            add("vars[tax_query][$index][terms][$i]", slug)
+        }
+        add("vars[tax_query][$index][operator]", "NOT IN")
+        return index + 1
+    }
+
+    private fun FormBody.existingTaxQueryMaxIndex(): Int = (0 until size).mapNotNull { i ->
+        TAX_QUERY_REGEX.find(encodedName(i))?.groupValues?.get(1)?.toInt()
+    }.maxOrNull() ?: -1
+
+    private fun excludedContentRatings(): List<String> = when (contentFilter) {
+        CONTENT_FILTER_SAFE -> listOf("suggestive", "erotica", "pornographic")
+        CONTENT_FILTER_SUGGESTIVE -> listOf("erotica", "pornographic")
+        CONTENT_FILTER_EROTICA -> listOf("pornographic")
+        else -> emptyList()
+    }
 
     // =========================== Details ==========================================
 
@@ -293,6 +372,34 @@ abstract class Manhuarm :
                 if (it.isNotBlank() && !it.contains("placeholder")) {
                     manga.thumbnail_url = it
                 }
+            }
+        }
+
+        // Release year at the top of the description
+        val releaseYear = document
+            .selectFirst(".post-content_item:contains(Release) .summary-content")
+            ?.let { it.ownText().ifBlank { it.text() } }
+            ?.trim()
+            .orEmpty()
+
+        // Alternative titles at the bottom of the description
+        val alternativeTitles = document
+            .selectFirst("#mrm-hero-alt-text")
+            ?.text()
+            ?.split("/")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() && !it.equals(manga.title, ignoreCase = true) }
+            ?.distinct()
+            .orEmpty()
+
+        manga.description = buildString {
+            if (releaseYear.isNotBlank()) {
+                append(i18n["released"]).append(": ").append(releaseYear).append("\n\n")
+            }
+            append(manga.description.orEmpty())
+            if (alternativeTitles.isNotEmpty()) {
+                append("\n\n").append(i18n["alternative_titles"]).append('\n')
+                alternativeTitles.forEach { append("· ").append(it).append('\n') }
             }
         }
 
@@ -526,6 +633,42 @@ abstract class Manhuarm :
             }
         }.also(screen::addPreference)
 
+        ListPreference(screen.context).apply {
+            key = CONTENT_FILTER_PREF
+            title = i18n["content_filter_title"]
+            summary = i18n["content_filter_summary"]
+            entries = arrayOf(
+                i18n["content_filter_safe"],
+                i18n["content_filter_suggestive"],
+                i18n["content_filter_erotica"],
+                i18n["content_filter_pornographic"],
+            )
+            entryValues = arrayOf(
+                CONTENT_FILTER_SAFE,
+                CONTENT_FILTER_SUGGESTIVE,
+                CONTENT_FILTER_EROTICA,
+                CONTENT_FILTER_PORNOGRAPHIC,
+            )
+            setDefaultValue(CONTENT_FILTER_SUGGESTIVE)
+            setOnPreferenceChange { _, newValue ->
+                contentFilter = newValue as String
+                true
+            }
+        }.also(screen::addPreference)
+
+        MultiSelectListPreference(screen.context).apply {
+            key = BLOCKED_GENRES_PREF
+            title = i18n["blocked_genres_title"]
+            summary = i18n["blocked_genres_summary"]
+            entries = GENRES.map { it.first }.toTypedArray()
+            entryValues = GENRES.map { it.second }.toTypedArray()
+            setDefaultValue(emptySet<String>())
+            setOnPreferenceChange { _, newValue ->
+                blockedGenres = (newValue as Set<*>).filterIsInstance<String>().toSortedSet()
+                true
+            }
+        }.also(screen::addPreference)
+
         if (language.target == language.origin) {
             return
         }
@@ -600,6 +743,13 @@ abstract class Manhuarm :
     companion object {
         val PAGE_REGEX = Regex(".*?\\.(webp|png|jpg|jpeg)#\\[.*?]", RegexOption.IGNORE_CASE)
 
+        private val TAX_QUERY_REGEX = Regex("""vars\[tax_query\]\[(\d+)\]""")
+
+        const val CONTENT_FILTER_SAFE = "safe"
+        const val CONTENT_FILTER_SUGGESTIVE = "suggestive"
+        const val CONTENT_FILTER_EROTICA = "erotica"
+        const val CONTENT_FILTER_PORNOGRAPHIC = "pornographic"
+
         const val DEVICE_FONT = "device:"
         private const val FONT_SIZE_PREF = "fontSizePref"
         private const val FONT_NAME_PREF = "fontNamePref"
@@ -609,6 +759,57 @@ abstract class Manhuarm :
         private const val TRANSLATE_SYNOPSIS_PREF = "translateSynopsisPref"
         private const val TRANSLATOR_PROVIDER_PREF = "translatorProviderPref"
         private const val CUSTOM_UA_PREF = "customUserAgentPref"
+        private const val CONTENT_FILTER_PREF = "contentFilterPref"
+        private const val BLOCKED_GENRES_PREF = "blockedGenresPref"
         private const val DEFAULT_FONT_SIZE = "28"
+
+        /** Genres supported by the site: display name to taxonomy slug. */
+        val GENRES = arrayOf(
+            "Action" to "action",
+            "Adult" to "adult",
+            "Adventure" to "adventure",
+            "Boys Love" to "boys-love",
+            "Comedy" to "comedy",
+            "Crime" to "crime",
+            "Doujinshi" to "doujinshi",
+            "Drama" to "drama",
+            "Ecchi" to "ecchi",
+            "Fantasy" to "fantasy",
+            "Girls Love" to "girls-love",
+            "Gourmet" to "gourmet",
+            "Harem" to "harem",
+            "Hentai" to "hentai",
+            "Historical" to "historical",
+            "Horror" to "horror",
+            "Isekai" to "isekai",
+            "Josei" to "josei",
+            "Lolicon" to "lolicon",
+            "Magical Girls" to "magical-girls",
+            "Mahou Shoujo" to "mahou-shoujo",
+            "Martial Arts" to "martial-arts",
+            "Mature" to "mature",
+            "Mecha" to "mecha",
+            "Medical" to "medical",
+            "Music" to "music",
+            "Mystery" to "mystery",
+            "Romance" to "romance",
+            "School Life" to "school-life",
+            "Sci-fi" to "sci-fi",
+            "Seinen" to "seinen",
+            "Shotacon" to "shotacon",
+            "Shoujo" to "shoujo",
+            "Shoujo Ai" to "shoujo-ai",
+            "Shounen" to "shounen",
+            "Shounen Ai" to "shounen-ai",
+            "Slice of Life" to "slice-of-life",
+            "Smut" to "smut",
+            "Sports" to "sports",
+            "Supernatural" to "supernatural",
+            "Thriller" to "thriller",
+            "Tragedy" to "tragedy",
+            "Wuxia" to "wuxia",
+            "Yaoi" to "yaoi",
+            "Yuri" to "yuri",
+        )
     }
 }
