@@ -185,7 +185,7 @@ final_extensions.sort(key=lambda ext: ext.packageName)
 index = index_pb2.Index(
     name="Dost",
     badgeLabel="DOST",
-    signingKey="76ED637405CA747D6AF3CD6433C11FD764E1C3B78B6204923059A726B1367B6C",
+    signingKey="76ed637405ca747d6af3cd6433c11fd764e1c3b78b6204923059a726b1367b6c",
     contact=index_pb2.Contact(
         website="https://github.com/avustr-code",
     ),

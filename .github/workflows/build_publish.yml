@@ -108,14 +108,14 @@ jobs:
   publish:
     name: Publish extension repo
     needs: [prepare, build]
-    # Run whenever there's anything to publish, new/changed builds OR only deletions
+    # Run whenever main changes, so index-only changes (e.g. signing key metadata)
+    # republish even when there is nothing to build or delete.
     if: >-
       always() &&
       github.repository == 'avustr-code/extensions-source' &&
       needs.prepare.result == 'success' &&
       needs.build.result != 'failure' &&
-      needs.build.result != 'cancelled' &&
-      needs.prepare.outputs.delete != '[]'
+      needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
