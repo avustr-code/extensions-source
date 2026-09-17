@@ -1,0 +1,113 @@
+# Sync upstream (keiyoushi) changes into this fork (avustr-code) daily.
+# Source: https://github.com/keiyoushi/extensions-source (fetch only, NEVER pushed to)
+# Target: https://github.com/avustr-code/extensions-source (this repo's main, auto-pushed)
+# Conflict rule: if upstream changed a file that this fork also changed, that file is skipped
+# (our version kept); all other upstream file changes are applied. A report issue is opened.
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # Daily at 00:00 UTC
+  workflow_dispatch: # Manual trigger from the Actions tab
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    if: "github.repository == 'avustr-code/extensions-source'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/keiyoushi/extensions-source.git"
+
+      - name: Fetch upstream and origin
+        run: |
+          git fetch --quiet upstream main
+          git fetch --quiet origin main
+
+      - name: Apply non-conflicting upstream changes
+        id: sync
+        run: |
+          set -euo pipefail
+
+          BASE=$(git merge-base origin/main upstream/main)
+          echo "Common base: $BASE"
+
+          # Files this fork changed since the common base.
+          git diff --name-only "$BASE" origin/main > /tmp/ours.txt
+
+          # Upstream changes since the common base (name-status: A/M/D/R...).
+          git diff --name-status "$BASE" upstream/main > /tmp/theirs.txt
+
+          conflicts=()
+          applied=0
+
+          while read -r status path extra; do
+            [ -z "$path" ] && continue
+
+            # For renames (R), the changed path is the new name (field 2); old name is field 3.
+            new_path="$path"
+            if [ "$status" = "R" ]; then
+              new_path="$extra"
+            fi
+
+            # Skip if this fork also touched the same path (conflict -> keep ours).
+            if grep -qx "$new_path" /tmp/ours.txt || { [ "$status" = "R" ] && grep -qx "$path" /tmp/ours.txt; }; then
+              conflicts+=("$new_path")
+              continue
+            fi
+
+            if [ "$status" = "D" ]; then
+              git rm --ignore-unmatch -- "$new_path" || true
+            else
+              git checkout "upstream/main" -- "$new_path"
+            fi
+            applied=$((applied + 1))
+          done < /tmp/theirs.txt
+
+          {
+            echo "applied=$applied"
+            echo "skipped=${#conflicts[@]}"
+            echo "conflicts<<EOF"
+            printf '%s\n' "${conflicts[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to sync."
+          fi
+
+      - name: Commit and push to avustr-code
+        if: ${{ steps.sync.outputs.applied != '0' && steps.sync.outputs.applied != '' }}
+        run: |
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/avustr-code/extensions-source.git"
+          git commit -m "chore: sync upstream changes ($(date -u +%Y-%m-%d))"
+          git push origin main
+
+      - name: Open report issue on conflicts
+        if: ${{ steps.sync.outputs.skipped != '0' && steps.sync.outputs.skipped != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="The following files were changed by upstream (keiyoushi) but also by this fork, \
+          so they were SKIPPED to preserve your changes:
+
+          ${{ steps.sync.outputs.conflicts }}
+
+          All other upstream changes were applied and pushed. Review the skipped files manually if needed."
+          gh issue create \
+            --title "Upstream sync: ${{ steps.sync.outputs.skipped }} file(s) skipped due to conflict" \
+            --body "$body" \
+            --label "upstream-sync"
