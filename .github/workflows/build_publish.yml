@@ -1,4 +1,4 @@
-name: CI
+name: Fork CI
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
       - '!**.md'
       - '!.github/**'
       - '.github/scripts/**'
-      - '.github/workflows/build_push.yml'
+      - '.github/workflows/build_publish.yml'
   workflow_dispatch:
 
 permissions: {}
@@ -37,10 +37,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Get last successful CI commit
-        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
-        with:
-          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
+      - name: Get fork divergence base (vs upstream)
+        run: |
+          git remote add upstream "https://github.com/keiyoushi/extensions-source.git" 2>/dev/null || git remote set-url upstream "https://github.com/keiyoushi/extensions-source.git"
+          git fetch --quiet upstream main
+          echo "NX_BASE=$(git merge-base origin/main upstream/main)" >> "$GITHUB_ENV"
+          echo "Diff base: $NX_BASE"
 
       - id: generate-matrices
         name: Create output matrices
@@ -91,7 +93,6 @@ jobs:
 
       - name: Upload APKs (${{ matrix.chunk.number }})
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: "github.repository == 'keiyoushi/extensions-source'"
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: |
@@ -110,7 +111,7 @@ jobs:
     # Run whenever there's anything to publish, new/changed builds OR only deletions
     if: >-
       always() &&
-      github.repository == 'keiyoushi/extensions-source' &&
+      github.repository == 'avustr-code/extensions-source' &&
       needs.prepare.result == 'success' &&
       needs.build.result != 'failure' &&
       needs.build.result != 'cancelled' &&
@@ -134,8 +135,8 @@ jobs:
       - name: Checkout repo branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: keiyoushi/extensions
-          token: ${{ secrets.BOT_PAT }}
+          repository: avustr-code/extensions
+          token: ${{ secrets.PUBLISH_PAT }}
           ref: repo
           path: repo
           persist-credentials: true
@@ -143,20 +144,20 @@ jobs:
       - name: Publish and deploy repo
         env:
           DELETE: ${{ needs.prepare.outputs.delete }}
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          GH_TOKEN: ${{ secrets.PUBLISH_PAT }}
         run: |
           cd repo
           pip install protobuf
           python -u ../main/.github/scripts/publish-repo.py "$DELETE" "$GITHUB_SHA"
-          git config --global user.email "156378334+keiyoushi-bot@users.noreply.github.com"
-          git config --global user.name "keiyoushi-bot"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
           git status
           if [ -n "$(git status --porcelain)" ]; then
             git add .
             git commit -m "Update extensions repo"
             git push
-            curl https://purge.jsdelivr.net/gh/keiyoushi/extensions@repo/index.json
-            curl https://purge.jsdelivr.net/gh/keiyoushi/extensions@repo/index.pb
+            curl https://purge.jsdelivr.net/gh/avustr-code/extensions@repo/index.json
+            curl https://purge.jsdelivr.net/gh/avustr-code/extensions@repo/index.pb
           else
             echo "No changes to commit"
           fi
