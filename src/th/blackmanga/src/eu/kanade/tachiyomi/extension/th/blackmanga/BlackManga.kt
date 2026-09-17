@@ -1,16 +1,16 @@
 package eu.kanade.tachiyomi.extension.th.blackmanga
 
 import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.utils.tryParseDate
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.Request
 import org.jsoup.nodes.Document
-import java.text.ParseException
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 @Source
 abstract class BlackManga : MangaThemesia() {
@@ -97,53 +97,48 @@ abstract class BlackManga : MangaThemesia() {
                 break
             }
         }
-        return try {
-            dateFormat.parse(date)?.time ?: 0L
-        } catch (_: ParseException) {
-            0L
-        }
+        return dateFormat.tryParseDate(date).takeIf { it != 0L }
+            ?: DateTimeFormatter.ofPattern(datePattern, Locale.US).tryParseDate(date)
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = if (query.isBlank()) {
-            baseUrl.toHttpUrl().newBuilder()
-                .addPathSegment("manga")
-                .addQueryParameter("page", page.toString())
-                .apply {
-                    filters.forEach { filter ->
-                        when (filter) {
-                            is StatusFilter -> addQueryParameter("status", filter.selectedValue())
-                            is TypeFilter -> addQueryParameter("type", filter.selectedValue())
-                            is OrderByFilter -> addQueryParameter("order", filter.selectedValue())
-                            is GenreListFilter ->
-                                filter.state
-                                    .filter { it.state != Filter.TriState.STATE_IGNORE }
-                                    .forEach {
-                                        val value = if (it.state == Filter.TriState.STATE_EXCLUDE) "-${it.value}" else it.value
-                                        addQueryParameter("genre[]", value)
-                                    }
-
-                            else -> {}
-                        }
-                    }
-                }
-                .build()
-        } else {
-            baseUrl.toHttpUrl().newBuilder()
-                .addQueryParameter("s", query)
-                .addQueryParameter("page", page.toString())
-                .build()
+    // The archive lives at /manga/ and filters are query parameters, while the site search is at
+    // the root and uses the "s" query parameter.
+    override fun searchMangaUrl(page: Int, query: String, filters: FilterList): HttpUrl.Builder {
+        if (query.isNotBlank()) {
+            return baseUrl.toHttpUrl().newBuilder().apply {
+                addQueryParameter("s", query)
+                addQueryParameter("page", page.toString())
+            }
         }
+        return baseUrl.toHttpUrl().newBuilder().apply {
+            addPathSegment("manga")
+            addQueryParameter("page", page.toString())
+            filters.forEach { filter ->
+                when (filter) {
+                    is StatusFilter -> addQueryParameter("status", filter.selectedValue())
+                    is TypeFilter -> addQueryParameter("type", filter.selectedValue())
+                    is OrderByFilter -> addQueryParameter("order", filter.selectedValue())
+                    is GenreListFilter ->
+                        filter.state
+                            .filter { it.state != Filter.TriState.STATE_IGNORE }
+                            .forEach {
+                                val value = if (it.state == Filter.TriState.STATE_EXCLUDE) "-${it.value}" else it.value
+                                addQueryParameter("genre[]", value)
+                            }
 
-        return GET(url, headers)
+                    else -> {}
+                }
+            }
+        }
     }
 
     // Manga pages are at the root and chapter slugs are the manga slug plus a "ตอนที่" suffix,
     // so a single non-empty path segment is enough to resolve a manga page.
-    override fun mangaPathFromUrl(urlString: String): String? {
-        val url = urlString.toHttpUrlOrNull() ?: return null
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) return null
-        return url.pathSegments.firstOrNull()?.takeIf { it.isNotBlank() }?.substringBefore("-ตอนที่")
+        val segment = url.pathSegments.firstOrNull()?.takeIf { it.isNotBlank() } ?: return null
+        val mangaUrl = "/${segment.substringBefore("-ตอนที่")}"
+        return getMangaDetails(SManga.create().apply { this.url = mangaUrl }).takeIf { it.title.isNotEmpty() }
     }
 
     // The site stores the release year in the "กำหนดปล่อย" infotable row and alternative names as
