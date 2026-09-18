@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+UPSTREAM_REF = os.getenv("UPSTREAM_REF")
+
 EXTENSION_REGEX = re.compile(r"^src/(?P<lang>\w+)/(?P<extension>\w+)")
 MULTISRC_LIB_REGEX = re.compile(r"^lib-multisrc/(?P<multisrc>\w+)")
 LIB_REGEX = re.compile(r"^lib/(?P<lib>\w+)")
@@ -148,8 +150,51 @@ def resolve_ext(multisrcs: set[str], libs: set[str]) -> set[tuple[str, str]]:
 
     return extensions
 
+def filter_ours_only(diff_output: list[str], upstream_ref: str) -> list[str]:
+    """
+    keep only changes that are genuinely ours: a modified/added path is
+    ours only when it differs in content from upstream (synced copies are
+    byte-identical and must not be rebuilt/released). Renames are checked
+    against their new path; deletions are always kept (removing a module
+    that is not in the fork's index is a no-op, and user-initiated
+    deletions must still be released).
+    """
+    kept = []
+    for line in diff_output:
+        status, *parts = line.split("\t", 2)
+        if not parts:
+            continue
+        path = parts[1] if len(parts) == 2 and status.startswith("R") else parts[0]
+        if status.startswith(("A", "M", "R")):
+            exists = (
+                subprocess.run(
+                    f"git cat-file -e HEAD:{path}",
+                    shell=True,
+                    capture_output=True,
+                ).returncode
+                == 0
+            )
+            if not exists:
+                continue
+            identical = (
+                subprocess.run(
+                    f"git diff --quiet HEAD {upstream_ref} -- {path}",
+                    shell=True,
+                    capture_output=True,
+                ).returncode
+                == 0
+            )
+            if identical:
+                continue
+        kept.append(line)
+    return kept
+
+
 def get_module_list(ref: str) -> tuple[list[str], list[str], list[str]]:
     diff_output = run_command(f"git diff --name-status {ref}").splitlines()
+
+    if UPSTREAM_REF:
+        diff_output = filter_ours_only(diff_output, UPSTREAM_REF)
 
     changed_files = [
         file

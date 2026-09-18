@@ -46,6 +46,8 @@ jobs:
 
       - id: generate-matrices
         name: Create output matrices
+        env:
+          UPSTREAM_REF: upstream/main
         run: |
           python ./.github/scripts/generate-build-matrices.py "$NX_BASE"
 
