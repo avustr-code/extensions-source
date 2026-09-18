@@ -57,14 +57,20 @@ jobs:
           while read -r status path extra; do
             [ -z "$path" ] && continue
 
-            # For renames (R), the changed path is the new name (field 2); old name is field 3.
+            # Never let upstream CI/config files override this fork's pipeline.
+            case "$path" in
+              .github/*) continue ;;
+            esac
+
+            # For renames (R-nn), the new path is field 3 and the old path (field 2) is gone upstream.
+            old_path=""
             new_path="$path"
-            if [ "$status" = "R" ]; then
-              new_path="$extra"
-            fi
+            case "$status" in
+              R*) old_path="$path"; new_path="$extra" ;;
+            esac
 
             # Skip if this fork also touched the same path (conflict -> keep ours).
-            if grep -qx "$new_path" /tmp/ours.txt || { [ "$status" = "R" ] && grep -qx "$path" /tmp/ours.txt; }; then
+            if grep -qx "$new_path" /tmp/ours.txt || { [ -n "$old_path" ] && grep -qx "$old_path" /tmp/ours.txt; }; then
               conflicts+=("$new_path")
               continue
             fi
@@ -73,6 +79,9 @@ jobs:
               git rm --ignore-unmatch -- "$new_path" || true
             else
               git checkout "upstream/main" -- "$new_path"
+              if [ -n "$old_path" ] && [ "$old_path" != "$new_path" ]; then
+                git rm --ignore-unmatch -- "$old_path" || true
+              fi
             fi
             applied=$((applied + 1))
           done < /tmp/theirs.txt
