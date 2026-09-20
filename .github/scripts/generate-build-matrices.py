@@ -8,6 +8,11 @@ from pathlib import Path
 
 UPSTREAM_REF = os.getenv("UPSTREAM_REF")
 
+# Fork-only extensions allowed to be built, released and kept in the delivery
+# index. Everything else (e.g. modules that merely drifted from upstream in a
+# sync window) must never be rebuilt or republished. Set in build_publish.yml.
+ALLOWED_MODULES = os.getenv("ALLOWED_MODULES")
+
 EXTENSION_REGEX = re.compile(r"^src/(?P<lang>\w+)/(?P<extension>\w+)")
 MULTISRC_LIB_REGEX = re.compile(r"^lib-multisrc/(?P<multisrc>\w+)")
 LIB_REGEX = re.compile(r"^lib/(?P<lib>\w+)")
@@ -23,6 +28,23 @@ def run_command(command: str) -> str:
         print(result.stderr.strip())
         sys.exit(result.returncode)
     return result.stdout.strip()
+
+
+def get_allowed() -> tuple[set[str], set[str]] | None:
+    """return (module ids, pkg suffixes) the fork is allowed to release.
+
+    Returns None when no allowlist is configured, leaving the caller's
+    behaviour unchanged (used by the PR-check workflow).
+    """
+    if not ALLOWED_MODULES:
+        return None
+    module_ids = set()
+    suffixes = set()
+    for token in ALLOWED_MODULES.replace(",", " ").split():
+        lang, extension = token.strip().split("/", 1)
+        module_ids.add(f":src:{lang}:{extension}")
+        suffixes.add(f"{lang}.{extension}")
+    return module_ids, suffixes
 
 
 def resolve_module_suffix(ref: str, lang: str, extension: str) -> str:
@@ -235,6 +257,7 @@ def get_module_list(ref: str) -> tuple[list[str], list[str], list[str]]:
         # update existing set so we include deleted extensions
         modules.update(all_modules)
         deleted.update(all_deleted)
+        modules, deleted = apply_allowlist(ref, modules, deleted)
 
         return sorted(modules), sorted(deleted), get_all_lint_modules()
 
@@ -258,6 +281,8 @@ def get_module_list(ref: str) -> tuple[list[str], list[str], list[str]]:
         *(f":lib-multisrc:{multisrc}" for multisrc in multisrcs),
     }
 
+    modules, deleted = apply_allowlist(ref, modules, deleted)
+
     return sorted(modules), sorted(deleted), sorted(lint_modules)
 
 def get_all_modules(ref: str) -> tuple[list[str], list[str]]:
@@ -268,6 +293,34 @@ def get_all_modules(ref: str) -> tuple[list[str], list[str]]:
             modules.append(f":src:{lang.name}:{extension.name}")
             deleted.append(resolve_module_suffix(ref, lang.name, extension.name))
     return modules, deleted
+
+
+def apply_allowlist(ref: str, modules: set[str], deleted: set[str]) -> tuple[set[str], set[str]]:
+    """restrict release candidates to the configured fork-only modules.
+
+    Anything outside the allowlist is never built and is additionally dropped
+    from the delivery index, so upstream drift can neither be republished nor
+    linger in the delivery repo.
+    """
+    allowed = get_allowed()
+    if not allowed:
+        return modules, deleted
+    allowed_ids, allowed_suffixes = allowed
+
+    filtered_modules = {m for m in modules if m in allowed_ids}
+
+    filtered_deleted = {d for d in deleted if d in allowed_suffixes}
+    for lang in Path("src").iterdir():
+        for extension in lang.iterdir():
+            if not (extension / "build.gradle.kts").is_file():
+                continue
+            suffix = f"{lang.name}.{extension.name}"
+            if suffix not in allowed_suffixes:
+                filtered_deleted.add(
+                    resolve_module_suffix(ref, lang.name, extension.name)
+                )
+
+    return filtered_modules, filtered_deleted
 
 
 def get_all_lint_modules() -> list[str]:
