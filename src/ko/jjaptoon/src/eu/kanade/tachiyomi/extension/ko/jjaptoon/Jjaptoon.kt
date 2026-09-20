@@ -94,7 +94,7 @@ abstract class Jjaptoon :
 
     // ============================== Latest ==============================
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage = parseMangaList("${currentBaseUrl()}/?selectedType=general&comicsPage=$page")
+    override suspend fun getLatestUpdates(page: Int): MangasPage = parseMangaList("${currentBaseUrl()}/?selectedSort=latest&selectedType=general&comicsPage=$page")
 
     // ============================== Search ==============================
 
@@ -241,7 +241,7 @@ abstract class Jjaptoon :
             }
             .maxOrNull() ?: currentPage
 
-        return MangasPage(mangas, currentPage < maxPage && mangas.isNotEmpty())
+        return MangasPage(mangas, mangas.size == PER_PAGE || (currentPage < maxPage && mangas.isNotEmpty()))
     }
 
     private fun parseDate(text: String?): Long = if (text.isNullOrBlank()) {
@@ -263,5 +263,6 @@ abstract class Jjaptoon :
         private const val PREF_FILTER_LANG_KEY = "pref_filter_lang_english"
         private const val PREF_PORTAL_KEY = "pref_portal_url"
         private const val DEFAULT_PORTAL_URL = "https://t.me/s/jjaptoon003"
+        private const val PER_PAGE = 36
     }
 }
