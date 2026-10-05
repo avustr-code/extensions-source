@@ -5,14 +5,14 @@ plugins {
 }
 
 keiyoushi {
-    name = "Madara Scans"
-    versionCode = 5
+    name = "Comic Action"
+    versionCode = 0
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
-    theme = "mangathemesia"
+    theme = "gigaviewer"
 
     source {
-        lang = "en"
-        baseUrl = "https://madarascans.net"
+        lang = "ja"
+        baseUrl = "https://comic-action.com"
     }
 }
