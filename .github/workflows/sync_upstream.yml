@@ -54,6 +54,10 @@ jobs:
           conflicts=()
           applied=0
 
+          # Extensions kept in sync with upstream verbatim: always take upstream's version,
+          # even if this fork previously touched the same path.
+          forced_sync_prefixes=("src/ko/goodtoon/" "src/ko/newxtoon/")
+
           while read -r status path extra; do
             [ -z "$path" ] && continue
 
@@ -69,8 +73,15 @@ jobs:
               R*) old_path="$path"; new_path="$extra" ;;
             esac
 
+            forced=0
+            for prefix in "${forced_sync_prefixes[@]}"; do
+              case "$new_path" in
+                "$prefix"*) forced=1 ;;
+              esac
+            done
+
             # Skip if this fork also touched the same path (conflict -> keep ours).
-            if grep -qx "$new_path" /tmp/ours.txt || { [ -n "$old_path" ] && grep -qx "$old_path" /tmp/ours.txt; }; then
+            if [ "$forced" -eq 0 ] && { grep -qx "$new_path" /tmp/ours.txt || { [ -n "$old_path" ] && grep -qx "$old_path" /tmp/ours.txt; }; }; then
               conflicts+=("$new_path")
               continue
             fi
