@@ -6,16 +6,16 @@ plugins {
 
 keiyoushi {
     name = "Comick"
-    versionCode = 1
+    versionCode = 2
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
     source {
-        baseUrl = "https://comick.dev"
         lang = "en"
+        baseUrl = "https://comick.dev"
     }
 
     deeplink {
-        path("/..*")
+        path("/comic/..*")
     }
 }
