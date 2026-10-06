@@ -1,498 +1,311 @@
 package eu.kanade.tachiyomi.extension.all.manhuarm
 
-import android.content.SharedPreferences
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
-import androidx.preference.MultiSelectListPreference
-import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.extension.all.manhuarm.interceptors.CloudflareWarmupInterceptor
 import eu.kanade.tachiyomi.extension.all.manhuarm.interceptors.ComposedImageInterceptor
-import eu.kanade.tachiyomi.extension.all.manhuarm.interceptors.OcrUrlInterceptor
 import eu.kanade.tachiyomi.extension.all.manhuarm.interceptors.TranslationInterceptor
+import eu.kanade.tachiyomi.extension.all.manhuarm.translator.TranslatorEngine
 import eu.kanade.tachiyomi.extension.all.manhuarm.translator.bing.BingTranslator
 import eu.kanade.tachiyomi.extension.all.manhuarm.translator.google.GoogleTranslator
-import eu.kanade.tachiyomi.multisrc.machinetranslations.translator.TranslatorEngine
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.multisrc.madara.Madara.LoadMoreStrategy
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.lib.i18n.Intl
 import keiyoushi.lib.i18n.Intl.Companion.createDefaultMessageFileName
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
-import kotlinx.serialization.encodeToString
-import okhttp3.FormBody
+import keiyoushi.utils.toJsonRequestBody
+import keiyoushi.utils.toJsonString
+import keiyoushi.utils.tryParseDate
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.CacheControl
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okhttp3.brotli.BrotliInterceptor
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.util.Calendar
-import java.util.Date
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.util.Locale
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class Manhuarm :
-    Madara(),
+    KeiSource(),
     ConfigurableSource {
 
-    private val language: Language by lazy {
-        when (lang) {
+    private val language: Language
+        get() = when (lang) {
             "ar" -> Language(lang, disableFontSettings = true)
             "fr", "id" -> Language(lang, supportNativeTranslation = true)
             "pt-BR" -> Language(lang, "pt", supportNativeTranslation = true)
             else -> Language(lang)
         }
-    }
 
-    override val useNewChapterEndpoint: Boolean = true
+    private val preferences by getPreferencesLazy()
 
-    // The site uses a custom child theme (`madara-child`) whose detail page markup
-    // differs from the default Madara theme (e.g. `mrm-hero__*` classes), so the
-    // default selectors don't match and `mangaDetailsParse` would crash on the `!!`
-    // title lookup. Override only the selectors that differ; the rest already match.
-    override val mangaDetailsSelectorTitle = "h1.mrm-hero__title, .mrm-hero__title"
-    override val mangaDetailsSelectorThumbnail = "div.mrm-hero__cover img"
-    override val mangaDetailsSelectorGenre = ".mrm-genres__list a"
+    private val fontSize get() = preferences.getString(FONT_SIZE_PREF, DEFAULT_FONT_SIZE)!!.toInt()
+    private val dialogBoxScale get() = preferences.getString(DIALOG_BOX_SCALE_PREF, language.dialogBoxScale.toString())!!.toFloat()
+    private val fontName get() = preferences.getString(FONT_NAME_PREF, language.fontName)!!
+    private val disableWordBreak get() = preferences.getBoolean(DISABLE_WORD_BREAK_PREF, language.disableWordBreak)
+    private val disableTranslator get() = preferences.getBoolean(DISABLE_TRANSLATOR_PREF, language.disableTranslator)
+    private val translateSynopsis get() = preferences.getBoolean(TRANSLATE_SYNOPSIS_PREF, language.translateSynopsis)
+    private val customUserAgent get() = preferences.getString(CUSTOM_UA_PREF, "")!!.trim()
 
-    /**
-     * The site renders manga lists (and search results) via AJAX and ignores regular
-     * pagination/ordering query parameters, so all listings must go through the
-     * `madara_load_more` endpoint.
-     */
-    override val useLoadMoreRequest: LoadMoreStrategy = LoadMoreStrategy.Always
+    private val settings: Language
+        get() = language.copy(
+            fontSize = fontSize,
+            fontName = fontName,
+            dialogBoxScale = dialogBoxScale,
+            disableWordBreak = disableWordBreak,
+            disableTranslator = disableTranslator,
+            translateSynopsis = translateSynopsis,
+            disableFontSettings = fontName == DEVICE_FONT,
+        )
 
-    private val preferences: SharedPreferences by getPreferencesLazy()
+    private val bingTranslator by lazy { BingTranslator(client) { headers } }
+    private val googleTranslator by lazy { GoogleTranslator(client) { headers } }
 
-    /**
-     * A flag that tracks whether the settings have been changed. It is used to indicate if
-     * any configuration change has occurred. Once the value is accessed, it resets to `false`.
-     * This is useful for tracking whether a preference has been modified, and ensures that
-     * the change status is cleared after it has been accessed, to prevent multiple triggers.
-     */
-    private var isSettingsChanged: Boolean = false
-        get() {
-            val current = field
-            field = false
-            return current
+    private val translator: TranslatorEngine
+        get() = when (preferences.getString(TRANSLATOR_PROVIDER_PREF, TRANSLATORS.first())) {
+            "Google" -> googleTranslator
+            else -> bingTranslator
         }
 
-    private var fontSize: Int
-        get() = preferences.getString(FONT_SIZE_PREF, DEFAULT_FONT_SIZE)!!.toInt()
-        set(value) = preferences.edit().putString(FONT_SIZE_PREF, value.toString()).apply()
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = connectTimeout(1.minutes)
+        .readTimeout(2.minutes)
+        .addInterceptor(TranslationInterceptor({ settings }, { translator }))
+        .addInterceptor(ComposedImageInterceptor { settings })
+        .rateLimit(3, 2.seconds) { it.host == BingTranslator.HOST || it.host == GoogleTranslator.HOST }
+        .rateLimit(2)
 
-    private var dialogBoxScale: Float
-        get() = preferences.getString(DIALOG_BOX_SCALE_PREF, language.dialogBoxScale.toString())!!.toFloat()
-        set(value) = preferences.edit().putString(DIALOG_BOX_SCALE_PREF, value.toString()).apply()
-
-    private var fontName: String
-        get() = preferences.getString(FONT_NAME_PREF, language.fontName)!!
-        set(value) = preferences.edit().putString(FONT_NAME_PREF, value).apply()
-
-    private var disableWordBreak: Boolean
-        get() = preferences.getBoolean(DISABLE_WORD_BREAK_PREF, language.disableWordBreak)
-        set(value) = preferences.edit().putBoolean(DISABLE_WORD_BREAK_PREF, value).apply()
-
-    private var disableTranslator: Boolean
-        get() = preferences.getBoolean(DISABLE_TRANSLATOR_PREF, language.disableTranslator)
-        set(value) = preferences.edit().putBoolean(DISABLE_TRANSLATOR_PREF, value).apply()
-
-    private var translateSynopsis: Boolean
-        get() = preferences.getBoolean(TRANSLATE_SYNOPSIS_PREF, language.translateSynopsis)
-        set(value) = preferences.edit().putBoolean(TRANSLATE_SYNOPSIS_PREF, value).apply()
-
-    private var customUserAgent: String
-        get() = preferences.getString(CUSTOM_UA_PREF, "")!!
-        set(value) = preferences.edit().putString(CUSTOM_UA_PREF, value).apply()
-
-    private var contentFilter: String
-        get() = preferences.getString(CONTENT_FILTER_PREF, CONTENT_FILTER_SUGGESTIVE)!!
-        set(value) = preferences.edit().putString(CONTENT_FILTER_PREF, value).apply()
-
-    private var blockedGenres: Set<String>
-        get() = preferences.getStringSet(BLOCKED_GENRES_PREF, emptySet())!!
-        set(value) = preferences.edit().putStringSet(BLOCKED_GENRES_PREF, value).apply()
-
-    private val i18n = Intl(
-        language = language.lang,
-        baseLanguage = "en",
-        availableLanguages = setOf("en", "es", "fr", "id", "it", "pt-BR"),
-        classLoader = this::class.java.classLoader!!,
-        createMessageFileName = { createDefaultMessageFileName("${name.lowercase()}_$it") },
-    )
-
-    private val settings get() = language.copy(
-        fontSize = this@Manhuarm.fontSize,
-        fontName = this@Manhuarm.fontName,
-        dialogBoxScale = this@Manhuarm.dialogBoxScale,
-        disableWordBreak = this@Manhuarm.disableWordBreak,
-        disableTranslator = this@Manhuarm.disableTranslator,
-        translateSynopsis = this@Manhuarm.translateSynopsis,
-        disableFontSettings = this@Manhuarm.fontName == DEVICE_FONT,
-    )
-
-    override val client: OkHttpClient get() = clientInstance!!
-
-    private val translators = arrayOf(
-        "Bing",
-        "Google",
-    )
-
-    private val provider: String get() =
-        preferences.getString(TRANSLATOR_PROVIDER_PREF, translators.first())!!
-
-    private val warmupInterceptor = CloudflareWarmupInterceptor(baseUrl, headers)
-
-    private val ocrUrlInterceptor by lazy { OcrUrlInterceptor(headers) }
-
-    /**
-     * This ensures that the `OkHttpClient` instance is only created when required, and it is rebuilt
-     * when there are configuration changes to ensure that the client uses the most up-to-date settings.
-     */
-    private var clientInstance: OkHttpClient? = null
-        get() {
-            if (field == null || isSettingsChanged) {
-                warmupInterceptor.reset()
-                field = clientBuilder()
-            }
-            return field
-        }
-
-    private val clientUtils = network.client.newBuilder()
-        .rateLimit(3, 2.seconds)
-        .build()
-
-    private lateinit var translator: TranslatorEngine
-
-    private fun clientBuilder(): OkHttpClient {
-        translator = when (provider) {
-            "Google" -> GoogleTranslator(clientUtils, headers)
-            else -> BingTranslator(clientUtils, headers)
-        }
-
-        return network.client.newBuilder()
-            .connectTimeout(1.minutes)
-            .readTimeout(2.minutes)
-            // Fix disk cache / decompression issues
-            .apply {
-                val index = networkInterceptors().indexOfFirst { it is BrotliInterceptor }
-                if (index >= 0) interceptors().add(networkInterceptors().removeAt(index))
-            }
-            .addInterceptor(warmupInterceptor)
-            .addInterceptorIf(
-                !disableTranslator && language.lang != language.origin,
-                TranslationInterceptor(settings, translator),
-            )
-            .addInterceptor(ComposedImageInterceptor(settings))
-            .rateLimit(2, 1.seconds)
-            .build()
+    override fun Headers.Builder.configureHeaders(): Headers.Builder = apply {
+        customUserAgent.takeIf(String::isNotEmpty)?.let { set("User-Agent", it) }
     }
 
-    override fun headersBuilder(): Headers.Builder {
-        val builder = super.headersBuilder()
-        val ua = customUserAgent.trim()
-        if (ua.isNotEmpty()) {
-            builder["User-Agent"] = ua
-        }
-        return builder
+    // ============================== Popular ===============================
+
+    override suspend fun getPopularManga(page: Int): MangasPage = archive(page, "trending")
+
+    // =============================== Latest ===============================
+
+    override suspend fun getLatestUpdates(page: Int): MangasPage = archive(page, "latest")
+
+    private suspend fun archive(page: Int, sort: String): MangasPage {
+        val path = if (page == 1) "/manga/" else "/manga/page/$page/"
+        val document = client.get("$baseUrl$path?sort=$sort").asJsoup()
+        return MangasPage(document.parseMangaList(), document.selectFirst("a.next") != null)
     }
 
-    private fun OkHttpClient.Builder.addInterceptorIf(condition: Boolean, interceptor: Interceptor): OkHttpClient.Builder = this.takeIf { condition.not() } ?: this.addInterceptor(interceptor)
+    // =============================== Search ===============================
 
-    private val translationAvailability = Calendar.getInstance().apply {
-        set(2025, Calendar.SEPTEMBER, 9, 0, 0, 0)
-        set(Calendar.MILLISECOND, 0)
-    }
-
-    // =========================== Popular ==========================================
-
-    override fun popularMangaSelector(): String = ".page-item-detail, .manga-card"
-
-    override fun popularMangaFromElement(element: Element): SManga {
-        val manga = SManga.create()
-        val titleEl = element.selectFirst(".post-title a, .manga-title a")
-        val thumbEl = element.selectFirst(".item-thumb img, .manga-thumb img, img")
-        manga.setUrlWithoutDomain(titleEl!!.attr("href"))
-        manga.title = titleEl.text()
-        manga.thumbnail_url = thumbEl?.extractCoverUrl()
-        return manga
-    }
-
-    // The `madara_load_more` endpoint returns an empty body once there are no more
-    // pages, so presence of a card marks the availability of the next page.
-    override fun popularMangaNextPageSelector(): String = ".manga-card"
-
-    // =========================== Latest ==========================================
-
-    override fun latestUpdatesSelector(): String = popularMangaSelector()
-
-    override fun latestUpdatesFromElement(element: Element): SManga {
-        val manga = SManga.create()
-        val titleEl = element.selectFirst(".manga-title a")
-            ?: element.selectFirst(".post-title a, h3.h5 a, .post-title h3 a")
-        val thumbEl = element.selectFirst(".manga-thumb img")
-            ?: element.selectFirst(".item-thumb img, img")
-        manga.setUrlWithoutDomain(titleEl!!.attr("href"))
-        manga.title = titleEl.text()
-        manga.thumbnail_url = thumbEl?.extractCoverUrl()
-        return manga
-    }
-
-    // =========================== Search ==========================================
-
-    override fun searchMangaNextPageSelector(): String = "div.c-tabs-item__content"
-
-    override fun loadMoreRequest(page: Int, popular: Boolean): Request {
-        val request = super.loadMoreRequest(page, popular)
-        val form = request.body as FormBody
-        val newForm = FormBody.Builder().apply {
-            for (i in 0 until form.size) {
-                add(form.name(i), form.value(i))
-            }
-            var taxIndex = form.existingTaxQueryMaxIndex() + 1
-            taxIndex = addContentRatingTaxQuery(taxIndex)
-            addBlockedGenresTaxQuery(taxIndex)
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = baseUrl.toHttpUrl().newBuilder().apply {
+            addQueryParameter("s", query)
+            addQueryParameter("post_type", "wp-manga")
+            filters.filterIsInstance<UrlFilter>().forEach { it.addToUrl(this) }
+            if (page > 1) addQueryParameter("pg", page.toString())
         }.build()
-        return request.newBuilder().post(newForm).build()
+        val document = client.get(url).asJsoup()
+        return MangasPage(document.parseMangaList(), document.selectFirst("a.mrm-pager__btn[rel=next]") != null)
     }
 
-    override fun searchLoadMoreRequest(page: Int, query: String, filters: FilterList): Request {
-        val request = super.searchLoadMoreRequest(page, query, filters)
-        val form = request.body as FormBody
-        val newForm = FormBody.Builder().apply {
-            for (i in 0 until form.size) {
-                add(form.name(i), form.value(i))
-            }
-            var taxIndex = form.existingTaxQueryMaxIndex() + 1
-            taxIndex = addContentRatingTaxQuery(taxIndex)
-            addBlockedGenresTaxQuery(taxIndex)
-        }.build()
-        return request.newBuilder().post(newForm).build()
+    override fun getFilterList(data: JsonElement?) = getFilters()
+
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        val slug = url.pathSegments.takeIf { it.size >= 2 && it[0] == "manga" }?.get(1)?.takeIf(String::isNotEmpty) ?: return null
+        val manga = SManga.create().apply { this.url = "/manga/$slug/" }
+        return client.get(getMangaUrl(manga)).asJsoup().parseDetails().apply { this.url = manga.url }
     }
 
-    /**
-     * Adds the site's content rating filter as a NOT IN taxonomy query, mirroring the
-     * `content_filter` preference of the site's own `mrm_prefs` cookie.
-     */
-    private fun FormBody.Builder.addContentRatingTaxQuery(index: Int): Int {
-        val excluded = excludedContentRatings()
-        if (excluded.isEmpty()) return index
-        add("vars[tax_query][$index][taxonomy]", "wp-manga-content-rating")
-        add("vars[tax_query][$index][field]", "slug")
-        excluded.forEachIndexed { i, slug ->
-            add("vars[tax_query][$index][terms][$i]", slug)
+    private fun Document.parseMangaList(): List<SManga> = select(".mrm-results__grid .mrm-r-item").map { element ->
+        val link = element.selectFirst("a.mrm-r-item__link")!!
+        SManga.create().apply {
+            setUrlWithoutDomain(link.absUrl("href"))
+            title = element.selectFirst(".mrm-r-item__title")?.text() ?: link.attr("title")
+            thumbnail_url = element.selectFirst(".mrm-r-item__art img")?.imageUrl()
         }
-        add("vars[tax_query][$index][operator]", "NOT IN")
-        return index + 1
     }
 
-    private fun FormBody.Builder.addBlockedGenresTaxQuery(index: Int): Int {
-        if (blockedGenres.isEmpty()) return index
-        add("vars[tax_query][$index][taxonomy]", "wp-manga-genre")
-        add("vars[tax_query][$index][field]", "slug")
-        blockedGenres.sorted().forEachIndexed { i, slug ->
-            add("vars[tax_query][$index][terms][$i]", slug)
-        }
-        add("vars[tax_query][$index][operator]", "NOT IN")
-        return index + 1
-    }
+    // =============================== Details ==============================
 
-    private fun FormBody.existingTaxQueryMaxIndex(): Int = (0 until size).mapNotNull { i ->
-        TAX_QUERY_REGEX.find(encodedName(i))?.groupValues?.get(1)?.toInt()
-    }.maxOrNull() ?: -1
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga)).asJsoup()
+        val details = document.parseDetails().apply { url = manga.url }
 
-    private fun excludedContentRatings(): List<String> = when (contentFilter) {
-        CONTENT_FILTER_SAFE -> listOf("suggestive", "erotica", "pornographic")
-        CONTENT_FILTER_SUGGESTIVE -> listOf("erotica", "pornographic")
-        CONTENT_FILTER_EROTICA -> listOf("pornographic")
-        else -> emptyList()
-    }
-
-    // =========================== Details ==========================================
-
-    /**
-     * Extracts the cover image URL from an image element, checking multiple attributes
-     * to handle lazy loading and different image formats.
-     */
-    private fun Element?.extractCoverUrl(): String? {
-        if (this == null) return null
-
-        // Try data-src first (lazy loading)
-        absUrl("data-src").takeIf { it.isNotBlank() && !it.contains("data:image") }?.let { return it }
-
-        // Try src attribute
-        absUrl("src").takeIf { it.isNotBlank() && !it.contains("data:image") && !it.contains("placeholder") }?.let { return it }
-
-        // Try srcset attribute (parse first URL)
-        attr("srcset").takeIf { it.isNotBlank() }?.let { srcset ->
-            srcset.split(",").firstOrNull()?.trim()?.split(" ")?.firstOrNull()?.let { url ->
-                if (url.startsWith("http")) {
-                    return url
-                } else {
-                    absUrl(url).takeIf { it.isNotBlank() && !it.contains("data:image") }?.let { return it }
-                }
-            }
+        val language = settings
+        if (fetchDetails && language.translateSynopsis && language.target != language.origin) {
+            details.description = details.description?.let { translator.translate(language.origin, language.target, it) }
         }
 
-        return null
+        val chapterList = document.select("li.wp-manga-chapter").map { element ->
+            val link = element.selectFirst("a")!!
+            SChapter.create().apply {
+                setUrlWithoutDomain(link.absUrl("href"))
+                name = link.text()
+                date_upload = parseChapterDate(element.selectFirst(".chapter-release-date")?.text())
+            }
+        }.filter { language.target == language.origin || it.date_upload > TRANSLATION_AVAILABILITY }
+
+        return SMangaUpdate(details, chapterList)
     }
 
-    override fun mangaDetailsParse(document: Document): SManga {
-        val manga = super.mangaDetailsParse(document)
-
-        if (translateSynopsis && language.target != language.origin && !manga.description.isNullOrBlank()) {
-            manga.description = translator.translate(language.origin, language.target, manga.description!!)
-        }
-
-        // Ensure cover is always set from detail page if it wasn't set from listing
-        if (manga.thumbnail_url.isNullOrBlank()) {
-            val coverEl = document.selectFirst(".summary_image img, .wp-post-image, .item-thumb img, .manga-thumb img, img.wp-post-image")
-            manga.thumbnail_url = coverEl?.extractCoverUrl()
-        } else {
-            // Even if cover was set, try to get a better quality version from detail page
-            val coverEl = document.selectFirst(".summary_image img, .wp-post-image, .item-thumb img, .manga-thumb img, img.wp-post-image")
-            coverEl?.extractCoverUrl()?.let {
-                if (it.isNotBlank() && !it.contains("placeholder")) {
-                    manga.thumbnail_url = it
-                }
+    private fun Document.parseDetails() = SManga.create().apply {
+        title = selectFirst("h1.mrm-hero__title")!!.text()
+        thumbnail_url = selectFirst(".mrm-hero__cover img")?.imageUrl()
+        author = select(".author-content a").eachText().joinToString().ifEmpty { null }
+        artist = select(".artist-content a").eachText().joinToString().ifEmpty { null }
+        genre = buildList {
+            addAll(select(".mrm-genres__list a").eachText())
+            addAll(select(".tags-content a").eachText())
+            summaryContent("Type")?.let(::add)
+        }.distinctBy(String::lowercase).joinToString().ifEmpty { null }
+        description = buildString {
+            selectFirst(".summary__content")?.let { summary ->
+                append(summary.select("p").takeIf { it.isNotEmpty() }?.joinToString("\n\n") { it.text() } ?: summary.text())
             }
-        }
-
-        // Release year at the top of the description
-        val releaseYear = document
-            .selectFirst(".post-content_item:contains(Release) .summary-content")
-            ?.let { it.ownText().ifBlank { it.text() } }
-            ?.trim()
-            .orEmpty()
-
-        // Alternative titles at the bottom of the description
-        val alternativeTitles = document
-            .selectFirst("#mrm-hero-alt-text")
-            ?.text()
-            ?.split("/")
-            ?.map { it.trim() }
-            ?.filter { it.isNotBlank() && !it.equals(manga.title, ignoreCase = true) }
-            ?.distinct()
-            .orEmpty()
-
-        manga.description = buildString {
-            if (releaseYear.isNotBlank()) {
-                append(i18n["released"]).append(": ").append(releaseYear).append("\n\n")
+            selectFirst("#mrm-hero-alt-text")?.text()?.takeIf(String::isNotEmpty)?.let {
+                if (isNotEmpty()) append("\n\n")
+                append("Alternative names: ", it)
             }
-            append(manga.description.orEmpty())
-            if (alternativeTitles.isNotEmpty()) {
-                append("\n\n").append(i18n["alternative_titles"]).append('\n')
-                alternativeTitles.forEach { append("· ").append(it).append('\n') }
-            }
+        }.ifEmpty { null }
+        status = when (summaryContent("Status")?.lowercase()) {
+            "ongoing" -> SManga.ONGOING
+            "completed" -> SManga.COMPLETED
+            "canceled" -> SManga.CANCELLED
+            "on hold" -> SManga.ON_HIATUS
+            else -> SManga.UNKNOWN
         }
-
-        return manga
     }
 
-    // =========================== Chapters =======================================
+    private fun Document.summaryContent(heading: String): String? = select(".post-content_item")
+        .firstOrNull { it.selectFirst(".summary-heading")?.text() == heading }
+        ?.selectFirst(".summary-content")?.text()
 
-    override fun chapterListParse(response: Response): List<SChapter> = super.chapterListParse(response).filter {
-        language.target == language.origin || Date(it.date_upload).after(translationAvailability.time)
+    private fun parseChapterDate(date: String?): Long {
+        val value = date?.lowercase() ?: return 0L
+        if (value.endsWith(" ago")) {
+            val amount = value.substringBefore(" ").toLongOrNull() ?: return 0L
+            val unit = when {
+                "min" in value -> ChronoUnit.MINUTES
+                "hour" in value -> ChronoUnit.HOURS
+                "day" in value -> ChronoUnit.DAYS
+                "week" in value -> ChronoUnit.WEEKS
+                "month" in value -> ChronoUnit.MONTHS
+                "year" in value -> ChronoUnit.YEARS
+                else -> ChronoUnit.SECONDS
+            }
+            return ZonedDateTime.now(ZoneOffset.UTC).minus(amount, unit).toInstant().toEpochMilli()
+        }
+        return DATE_FORMAT.tryParseDate(date)
     }
 
-    // =========================== Pages ==========================================
+    // =============================== Pages ================================
 
-    override fun pageListParse(document: Document): List<Page> {
-        val pages = super.pageListParse(document)
-        val chapterUrl = document.location().toHttpUrl().newBuilder()
-            .removeAllQueryParameters("style")
-            .build()
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterUrl = getChapterUrl(chapter)
+        // The OCR credentials embedded in the page are single-use
+        val document = client.get(chapterUrl, cacheControl = CacheControl.FORCE_NETWORK).asJsoup()
+        val images = document.select("div.page-break img, img.wp-manga-chapter-img")
+            .mapNotNull { it.imageUrl() }
+            .distinct()
 
-        val ocrRequest = ocrUrlInterceptor.getOcrRequest(chapterUrl.toString()) ?: return pages
+        val dialogues = fetchDialogues(document, chapterUrl).associateBy(PageDto::imageUrl)
+        val language = settings
 
-        val jsonHeaders = Headers.Builder().apply {
-            add("Referer", chapterUrl.toString())
-            add("Accept", "*/*")
-
-            ocrRequest.interceptedHeaders.forEach { (name, value) ->
-                set(name, value)
-            }
-        }.build()
-
-        val dialog = try {
-            val response = client.newCall(
-                POST(
-                    ocrRequest.url,
-                    jsonHeaders,
-                    ocrRequest.body.toRequestBody("application/json; charset=utf-8".toMediaType()),
-                ),
-            ).execute()
-
-            // If server returns error (403, etc), skip translations
-            if (!response.isSuccessful) {
-                response.close()
-                emptyList()
+        return images.mapIndexed { index, imageUrl ->
+            val dialogs = dialogues[imageUrl.substringAfterLast('/')]
+                ?.dialogues
+                ?.filter { it.getTextBy(language).isNotBlank() }
+                .orEmpty()
+            if (dialogs.isEmpty()) {
+                Page(index, imageUrl = imageUrl)
             } else {
-                response.parseAs<List<PageDto>>()
+                // '#' would end the fragment early
+                Page(index, imageUrl = "$imageUrl#${dialogs.toJsonString().replace("#", "*")}")
             }
+        }
+    }
+
+    /**
+     * The chapter page embeds the OCR endpoint and its gate credentials in a `_0xvault` array:
+     * `[cid, token, timestamp, nonce, endpoint, ref]`.
+     */
+    private suspend fun fetchDialogues(document: Document, chapterUrl: String): List<PageDto> {
+        val vault = document.select("script").firstNotNullOfOrNull { VAULT_REGEX.find(it.data()) }
+            ?.groupValues?.get(1)
+            ?.parseAs<List<JsonPrimitive>>()
+            ?.map(JsonPrimitive::content)
+            ?.takeIf { it.size > 5 && it[4].contains("fetch-ocr") }
+            ?: return emptyList()
+
+        val ocrHeaders = headers.newBuilder()
+            .set("Referer", chapterUrl)
+            .set("Accept", "*/*")
+            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Cache-Control", "no-cache")
+            .set("X-Gate-Token", vault[1])
+            .set("X-Gate-Timestamp", vault[2])
+            .set("X-Gate-Nonce", vault[3])
+            .build()
+
+        // Pages are still readable without the translation overlay
+        return try {
+            client.post(vault[4], ocrHeaders, OcrRequestDto(vault[0], vault[5]).toJsonRequestBody())
+                .parseAs<List<PageDto>>()
         } catch (_: Exception) {
-            // If JSON parsing fails, skip translations
             emptyList()
         }
+    }
 
-        if (dialog.isEmpty()) {
-            return pages
-        }
+    // =============================== Utils ================================
 
-        return dialog.mapIndexed { index, dto ->
-            val page = pages.first { it.imageUrl?.contains(dto.imageUrl, true)!! }
-            val fragment = json.encodeToString<List<Dialog>>(
-                dto.dialogues.filter { it.getTextBy(language).isNotBlank() },
-            )
-            if (dto.dialogues.isEmpty()) {
-                return@mapIndexed page
-            }
-
-            Page(index, imageUrl = "${page.imageUrl}${fragment.toFragment()}")
+    private fun Element.imageUrl(): String? {
+        val key = listOf("data-src", "data-lazy-src", "src").firstOrNull { attr(it).isNotBlank() } ?: return null
+        val value = attr(key).trim()
+        return when {
+            value.startsWith("data:") -> null
+            value.startsWith("http") -> value
+            else -> absUrl(key)
         }
     }
 
-    override fun imageRequest(page: Page): Request {
-        val imageHeaders = headersBuilder()
-            .set("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
-            .set("Referer", "$baseUrl/")
-            .set("Connection", "keep-alive")
-            .set("Accept-Language", "pt-BR,en-US;q=0.9,en;q=0.8")
-            .set("Accept-Encoding", "gzip, deflate, br, zstd")
-            .set("Sec-Fetch-Dest", "image")
-            .set("Sec-Fetch-Mode", "no-cors")
-            .set("Sec-Fetch-Site", "cross-site")
-            .set("Sec-Fetch-Storage-Access", "none")
-            .set("Priority", "u=5, i")
-            .set("TE", "trailers")
-            .build()
-
-        return GET(page.imageUrl!!, imageHeaders)
-    }
-
-    // ================================ Utils ============================================
-
-    // Prevent bad fragments
-    fun String.toFragment(): String = "#${this.replace("#", "*")}"
+    // ============================= Preferences ============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val language = language
+        val i18n = Intl(
+            language = language.lang,
+            baseLanguage = "en",
+            availableLanguages = setOf("en", "es", "fr", "id", "it", "pt-BR"),
+            classLoader = this::class.java.classLoader!!,
+            createMessageFileName = { createDefaultMessageFileName("${name.lowercase()}_$it") },
+        )
+
         // Some libreoffice font sizes
         val sizes = arrayOf(
             "12", "13", "14",
@@ -505,7 +318,7 @@ abstract class Manhuarm :
             "80", "88", "96",
         )
 
-        val scale = (0..10).map { 1f + it / 10f }.toTypedArray()
+        val scale = (0..10).map { 1f + it / 10f }
 
         val fonts = arrayOf(
             i18n["font_name_device_title"] to DEVICE_FONT,
@@ -514,6 +327,14 @@ abstract class Manhuarm :
             "Coming Soon" to "coming_soon_regular",
         )
 
+        fun ListPreference.toastOnChange(message: (String) -> String) {
+            setOnPreferenceChangeListener { _, newValue ->
+                val entry = entries[findIndexOfValue(newValue as String)] as String
+                Toast.makeText(screen.context, message(entry), Toast.LENGTH_LONG).show()
+                true
+            }
+        }
+
         ListPreference(screen.context).apply {
             key = FONT_SIZE_PREF
             title = i18n["font_size_title"]
@@ -521,29 +342,9 @@ abstract class Manhuarm :
                 "${it}pt" + if (it == DEFAULT_FONT_SIZE) " - ${i18n["default_font_size"]}" else ""
             }.toTypedArray()
             entryValues = sizes
-
-            summary = buildString {
-                appendLine(i18n["font_size_summary"])
-                append("\t* %s")
-            }
-
-            setDefaultValue(fontSize.toString())
-
-            setOnPreferenceChange { _, newValue ->
-                val selected = newValue as String
-                val index = this.findIndexOfValue(selected)
-                val entry = entries[index] as String
-
-                fontSize = selected.toInt()
-
-                Toast.makeText(
-                    screen.context,
-                    i18n["font_size_message"].format(entry),
-                    Toast.LENGTH_LONG,
-                ).show()
-
-                true // It's necessary to update the user interface
-            }
+            summary = "${i18n["font_size_summary"]}\n\t* %s"
+            setDefaultValue(DEFAULT_FONT_SIZE)
+            toastOnChange { i18n["font_size_message"].format(it) }
         }.also(screen::addPreference)
 
         ListPreference(screen.context).apply {
@@ -553,29 +354,9 @@ abstract class Manhuarm :
                 "${it}x" + if (it == 1f) " - ${i18n["dialog_box_scale_default"]}" else ""
             }.toTypedArray()
             entryValues = scale.map(Float::toString).toTypedArray()
-
-            summary = buildString {
-                appendLine(i18n["dialog_box_scale_summary"])
-                append("\t* %s")
-            }
-
-            setDefaultValue(dialogBoxScale.toString())
-
-            setOnPreferenceChange { _, newValue ->
-                val selected = newValue as String
-                val index = this.findIndexOfValue(selected)
-                val entry = entries[index] as String
-
-                dialogBoxScale = selected.toFloat()
-
-                Toast.makeText(
-                    screen.context,
-                    i18n["dialog_box_scale_message"].format(entry),
-                    Toast.LENGTH_LONG,
-                ).show()
-
-                true // It's necessary to update the user interface
-            }
+            summary = "${i18n["dialog_box_scale_summary"]}\n\t* %s"
+            setDefaultValue(language.dialogBoxScale.toString())
+            toastOnChange { i18n["dialog_box_scale_message"].format(it) }
         }.also(screen::addPreference)
 
         if (!language.disableFontSettings) {
@@ -583,31 +364,12 @@ abstract class Manhuarm :
                 key = FONT_NAME_PREF
                 title = i18n["font_name_title"]
                 entries = fonts.map {
-                    it.first + if (it.second.isBlank()) " - ${i18n["default_font_name"]}" else ""
+                    it.first + if (it.second == language.fontName) " - ${i18n["default_font_name"]}" else ""
                 }.toTypedArray()
                 entryValues = fonts.map { it.second }.toTypedArray()
-                summary = buildString {
-                    appendLine(i18n["font_name_summary"])
-                    append("\t* %s")
-                }
-
-                setDefaultValue(fontName)
-
-                setOnPreferenceChange { _, newValue ->
-                    val selected = newValue as String
-                    val index = this.findIndexOfValue(selected)
-                    val entry = entries[index] as String
-
-                    fontName = selected
-
-                    Toast.makeText(
-                        screen.context,
-                        i18n["font_name_message"].format(entry),
-                        Toast.LENGTH_LONG,
-                    ).show()
-
-                    true // It's necessary to update the user interface
-                }
+                summary = "${i18n["font_name_summary"]}\n\t* %s"
+                setDefaultValue(language.fontName)
+                toastOnChange { i18n["font_name_message"].format(it) }
             }.also(screen::addPreference)
         }
 
@@ -616,57 +378,13 @@ abstract class Manhuarm :
             title = "⚠ ${i18n["disable_word_break_title"]}"
             summary = i18n["disable_word_break_summary"]
             setDefaultValue(language.disableWordBreak)
-            setOnPreferenceChange { _, newValue ->
-                disableWordBreak = newValue as Boolean
-                true
-            }
         }.also(screen::addPreference)
 
         EditTextPreference(screen.context).apply {
             key = CUSTOM_UA_PREF
             title = i18n["custom_user_agent_title"]
             summary = i18n["custom_user_agent_message"]
-            setDefaultValue(customUserAgent)
-            setOnPreferenceChange { _, newValue ->
-                customUserAgent = (newValue as String).trim()
-                true
-            }
-        }.also(screen::addPreference)
-
-        ListPreference(screen.context).apply {
-            key = CONTENT_FILTER_PREF
-            title = i18n["content_filter_title"]
-            summary = i18n["content_filter_summary"]
-            entries = arrayOf(
-                i18n["content_filter_safe"],
-                i18n["content_filter_suggestive"],
-                i18n["content_filter_erotica"],
-                i18n["content_filter_pornographic"],
-            )
-            entryValues = arrayOf(
-                CONTENT_FILTER_SAFE,
-                CONTENT_FILTER_SUGGESTIVE,
-                CONTENT_FILTER_EROTICA,
-                CONTENT_FILTER_PORNOGRAPHIC,
-            )
-            setDefaultValue(CONTENT_FILTER_SUGGESTIVE)
-            setOnPreferenceChange { _, newValue ->
-                contentFilter = newValue as String
-                true
-            }
-        }.also(screen::addPreference)
-
-        MultiSelectListPreference(screen.context).apply {
-            key = BLOCKED_GENRES_PREF
-            title = i18n["blocked_genres_title"]
-            summary = i18n["blocked_genres_summary"]
-            entries = GENRES.map { it.first }.toTypedArray()
-            entryValues = GENRES.map { it.second }.toTypedArray()
-            setDefaultValue(emptySet<String>())
-            setOnPreferenceChange { _, newValue ->
-                blockedGenres = (newValue as Set<*>).filterIsInstance<String>().toSortedSet()
-                true
-            }
+            setDefaultValue("")
         }.also(screen::addPreference)
 
         if (language.target == language.origin) {
@@ -679,10 +397,6 @@ abstract class Manhuarm :
                 title = "⚠ ${i18n["disable_translator_title"]}"
                 summary = i18n["disable_translator_summary"]
                 setDefaultValue(language.disableTranslator)
-                setOnPreferenceChange { _, newValue ->
-                    disableTranslator = newValue as Boolean
-                    true
-                }
             }.also(screen::addPreference)
         }
 
@@ -691,64 +405,31 @@ abstract class Manhuarm :
             title = i18n["translate_synopsis_title"]
             summary = i18n["translate_synopsis_summary"]
             setDefaultValue(language.translateSynopsis)
-            setOnPreferenceChange { _, newValue ->
-                translateSynopsis = newValue as Boolean
-                true
-            }
         }.also(screen::addPreference)
 
         if (!disableTranslator || translateSynopsis) {
             ListPreference(screen.context).apply {
                 key = TRANSLATOR_PROVIDER_PREF
                 title = i18n["translate_dialog_box_title"]
-                entries = translators
-                entryValues = translators
-                summary = buildString {
-                    appendLine(i18n["translate_dialog_box_summary"])
-                    append("\t* %s")
-                }
-
-                setDefaultValue(translators.first())
-
-                setOnPreferenceChange { _, newValue ->
-                    val selected = newValue as String
-                    val index = this.findIndexOfValue(selected)
-                    val entry = entries[index] as String
-
-                    Toast.makeText(
-                        screen.context,
-                        "${i18n["translate_dialog_box_toast"]} '$entry'",
-                        Toast.LENGTH_LONG,
-                    ).show()
-
-                    true
-                }
+                entries = TRANSLATORS
+                entryValues = TRANSLATORS
+                summary = "${i18n["translate_dialog_box_summary"]}\n\t* %s"
+                setDefaultValue(TRANSLATORS.first())
+                toastOnChange { "${i18n["translate_dialog_box_toast"]} '$it'" }
             }.also(screen::addPreference)
-        }
-    }
-
-    /**
-     * Sets an `OnPreferenceChangeListener` for the preference, and before triggering the original listener,
-     * marks that the configuration has changed by setting `isSettingsChanged` to `true`.
-     * This behavior is useful for applying runtime configurations in the HTTP client,
-     * ensuring that the preference change is registered before invoking the original listener.
-     */
-    private fun Preference.setOnPreferenceChange(onPreferenceChangeListener: Preference.OnPreferenceChangeListener) {
-        setOnPreferenceChangeListener { preference, newValue ->
-            isSettingsChanged = true
-            onPreferenceChangeListener.onPreferenceChange(preference, newValue)
         }
     }
 
     companion object {
         val PAGE_REGEX = Regex(".*?\\.(webp|png|jpg|jpeg)#\\[.*?]", RegexOption.IGNORE_CASE)
 
-        private val TAX_QUERY_REGEX = Regex("""vars\[tax_query\]\[(\d+)\]""")
+        private val VAULT_REGEX = Regex("""_0xvault\s*=\s*(\[.*?])""", RegexOption.DOT_MATCHES_ALL)
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("MMMM d, yyyy", Locale.ENGLISH)
 
-        const val CONTENT_FILTER_SAFE = "safe"
-        const val CONTENT_FILTER_SUGGESTIVE = "suggestive"
-        const val CONTENT_FILTER_EROTICA = "erotica"
-        const val CONTENT_FILTER_PORNOGRAPHIC = "pornographic"
+        // Machine translations are only available for chapters released after 2025-09-09
+        private const val TRANSLATION_AVAILABILITY = 1757376000000L
+
+        private val TRANSLATORS = arrayOf("Bing", "Google")
 
         const val DEVICE_FONT = "device:"
         private const val FONT_SIZE_PREF = "fontSizePref"
@@ -759,57 +440,6 @@ abstract class Manhuarm :
         private const val TRANSLATE_SYNOPSIS_PREF = "translateSynopsisPref"
         private const val TRANSLATOR_PROVIDER_PREF = "translatorProviderPref"
         private const val CUSTOM_UA_PREF = "customUserAgentPref"
-        private const val CONTENT_FILTER_PREF = "contentFilterPref"
-        private const val BLOCKED_GENRES_PREF = "blockedGenresPref"
         private const val DEFAULT_FONT_SIZE = "28"
-
-        /** Genres supported by the site: display name to taxonomy slug. */
-        val GENRES = arrayOf(
-            "Action" to "action",
-            "Adult" to "adult",
-            "Adventure" to "adventure",
-            "Boys Love" to "boys-love",
-            "Comedy" to "comedy",
-            "Crime" to "crime",
-            "Doujinshi" to "doujinshi",
-            "Drama" to "drama",
-            "Ecchi" to "ecchi",
-            "Fantasy" to "fantasy",
-            "Girls Love" to "girls-love",
-            "Gourmet" to "gourmet",
-            "Harem" to "harem",
-            "Hentai" to "hentai",
-            "Historical" to "historical",
-            "Horror" to "horror",
-            "Isekai" to "isekai",
-            "Josei" to "josei",
-            "Lolicon" to "lolicon",
-            "Magical Girls" to "magical-girls",
-            "Mahou Shoujo" to "mahou-shoujo",
-            "Martial Arts" to "martial-arts",
-            "Mature" to "mature",
-            "Mecha" to "mecha",
-            "Medical" to "medical",
-            "Music" to "music",
-            "Mystery" to "mystery",
-            "Romance" to "romance",
-            "School Life" to "school-life",
-            "Sci-fi" to "sci-fi",
-            "Seinen" to "seinen",
-            "Shotacon" to "shotacon",
-            "Shoujo" to "shoujo",
-            "Shoujo Ai" to "shoujo-ai",
-            "Shounen" to "shounen",
-            "Shounen Ai" to "shounen-ai",
-            "Slice of Life" to "slice-of-life",
-            "Smut" to "smut",
-            "Sports" to "sports",
-            "Supernatural" to "supernatural",
-            "Thriller" to "thriller",
-            "Tragedy" to "tragedy",
-            "Wuxia" to "wuxia",
-            "Yaoi" to "yaoi",
-            "Yuri" to "yuri",
-        )
     }
 }

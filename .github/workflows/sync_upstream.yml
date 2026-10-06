@@ -56,7 +56,7 @@ jobs:
 
           # Extensions kept in sync with upstream verbatim: always take upstream's version,
           # even if this fork previously touched the same path.
-          forced_sync_prefixes=("src/ko/goodtoon/" "src/ko/newxtoon/")
+          forced_sync_prefixes=("src/ko/goodtoon/" "src/ko/newxtoon/" "src/all/manhuarm/")
 
           while read -r status path extra; do
             [ -z "$path" ] && continue
