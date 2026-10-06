@@ -7,60 +7,77 @@ import kotlinx.serialization.json.JsonObject
 /**
  * Resolves the short field names the site's Next.js RSC payload uses.
  *
- * The site renames a fixed set of fields to keys it derives at runtime, so any key literal
- * committed here goes stale as soon as the site rotates the salt. The derivation lives in the
- * site's own client bundle (module `14834`), which is why it can be reproduced and re-read
- * instead of hardcoded.
+ * The site renames a fixed set of fields to keys it derives in its own client bundle (module
+ * `14834`): a positional list of the logical names, then a salt string that each name slices a
+ * key out of. Reading that table from the bundle means a rebuild that rotates the salt does not
+ * need an extension update, unlike the key literals it replaces.
  */
 internal object RscKeys {
 
-    /** Last salt seen in the bundle; used until the payload proves it stale. */
-    const val DEFAULT_SALT = "d5c68d61d4c2"
-
     /**
-     * The renamed fields, in the exact order the bundle hashes them. Order is part of the
-     * derivation: a collision bumps the counter and every later key shifts with it.
+     * The bundle's table: an array literal of logical names, then the variable holding the salt
+     * string, e.g. `["Chapter",...],a="o682...fk";`.
      */
-    val FIELDS = listOf(
-        "series_slug",
-        "Season",
-        "Chapter",
-        "price",
-        "title",
-        "chapter_name",
-        "chapter_slug",
-        "images",
+    private val TABLE_REGEX = Regex(
+        """\[((?:"[A-Za-z0-9_]+",?)+)],\s*([A-Za-z0-9_$]{1,40})\s*=\s*"([A-Za-z0-9]+)"""",
     )
 
-    /** The bundle's own literal for [FIELDS]; finding it in a chunk is how the salt is located. */
-    private val FIELD_LIST_LITERAL = FIELDS.joinToString(",") { "\"$it\"" }
+    private val NAME_REGEX = Regex("\"([A-Za-z0-9_]+)\"")
 
-    /** The salt is a hex literal immediately before the `":"` the derivation concatenates onto it. */
-    private val SALT_REGEX = Regex("""["']([0-9a-f]{8,32})["']\s*,\s*["']:["']""")
+    /** The rotation applied to every slot index, e.g. `l=1+a.charCodeAt(0)%15`. */
+    private val OFFSET_REGEX = Regex(
+        """([A-Za-z0-9_$]{1,40})\s*=\s*(\d+)\s*\+\s*([A-Za-z0-9_$]{1,40})\.charCodeAt\(0\)\s*%\s*(\d+)""",
+    )
 
-    private const val FNV_OFFSET_BASIS = -2128831035 // 2166136261 as signed 32-bit
-    private const val FNV_PRIME = 16777619
+    /** The slot count and the per-slot slice length, e.g. `(t+l)%16*7`. */
+    private val SLOT_REGEX = Regex(
+        """\(\s*[A-Za-z0-9_$]{1,40}\s*\+\s*([A-Za-z0-9_$]{1,40})\s*\)\s*%\s*(\d+)\s*\*\s*(\d+)""",
+    )
 
-    /**
-     * Maps each logical field name to the short key the payload uses for it, for a given [salt].
-     */
-    fun derive(salt: String): Map<String, String> {
-        val used = mutableSetOf<String>()
-        return FIELDS.associateWith { field ->
-            var collisionIndex = 0
-            var key: String
-            do {
-                key = encode(fnv1a32("$salt:$field:$collisionIndex"))
-                collisionIndex++
-            } while (key in used)
-            used += key
-            key
+    /** How far past the names array the minified derivation may sit before it is not the one. */
+    private const val DERIVATION_WINDOW = 600
+
+    /** Reads the rename table from a client chunk, or returns `null` if this chunk is not the one. */
+    fun findTable(chunkSource: String): Map<String, String>? {
+        for (match in TABLE_REGEX.findAll(chunkSource)) {
+            val names = NAME_REGEX.findAll(match.groupValues[1]).map { it.groupValues[1] }.toList()
+            val saltVar = match.groupValues[2]
+            val salt = match.groupValues[3]
+
+            val derivation = chunkSource.substring(
+                match.range.last + 1,
+                minOf(chunkSource.length, match.range.last + 1 + DERIVATION_WINDOW),
+            )
+            val offset = OFFSET_REGEX.findAll(derivation).firstOrNull { it.groupValues[3] == saltVar } ?: continue
+            val slot = SLOT_REGEX.findAll(derivation).firstOrNull { it.groupValues[1] == offset.groupValues[1] } ?: continue
+
+            val slotCount = slot.groupValues[2].toInt()
+            val keyLength = slot.groupValues[3].toInt()
+            // The bundle's own guard: the salt must divide evenly into its slots and name every field.
+            if (salt.length != slotCount * keyLength || names.size > slotCount) continue
+
+            val start = offset.groupValues[2].toInt() + salt[0].code % offset.groupValues[4].toInt()
+            return names.mapIndexed { index, name ->
+                val position = (index + start) % slotCount * keyLength
+                name to salt.substring(position, position + keyLength)
+            }.toMap()
         }
+
+        return null
     }
+
+    /** Flattens [keys] into the single preference value that caches the table. */
+    fun encode(keys: Map<String, String>): String = keys.entries.joinToString(",") { "${it.key}=${it.value}" }
+
+    /** Reads back what [encode] wrote. */
+    fun decode(stored: String): Map<String, String> = stored.split(",").mapNotNull { entry ->
+        val separator = entry.indexOf('=')
+        if (separator <= 0) null else entry.take(separator) to entry.substring(separator + 1)
+    }.toMap()
 
     /**
      * Rewrites every short key in [element] to its logical name, so the payload can be decoded
-     * into the DTOs without them knowing about the salt at all.
+     * into the DTOs without them knowing about the rename at all.
      */
     fun remap(element: JsonElement, keys: Map<String, String>): JsonElement {
         val byShortKey = keys.entries.associate { (field, key) -> key to field }
@@ -76,9 +93,9 @@ internal object RscKeys {
 
     /**
      * Builds the predicate that picks the payload node holding [fields] out of the resolved RSC
-     * tree. Names not in [FIELDS] are not renamed by the site, so they are matched as-is.
+     * tree. Names the site does not rename are absent from [keys], so they are matched as-is.
      *
-     * [fields] must include at least one renamed field: a stale salt is only detectable when the
+     * [fields] must include at least one renamed field: a stale table is only detectable when the
      * predicate stops matching, and a node identified purely by unrenamed keys (e.g. the
      * `seriesData` wrapper) matches either way and would silently decode to empty instead.
      */
@@ -97,28 +114,5 @@ internal object RscKeys {
         } else {
             { element -> element is JsonObject && element.keys.containsAll(required) }
         }
-    }
-
-    /** Extracts the salt from a client chunk, or returns `null` if this chunk is not the one. */
-    fun findSalt(chunkSource: String): String? {
-        val fieldsAt = chunkSource.indexOf(FIELD_LIST_LITERAL)
-        if (fieldsAt == -1) return null
-
-        return SALT_REGEX.find(chunkSource, fieldsAt)?.groupValues?.get(1)
-    }
-
-    private fun fnv1a32(value: String): Int {
-        var hash = FNV_OFFSET_BASIS
-        for (char in value) {
-            hash = hash xor char.code
-            hash *= FNV_PRIME
-        }
-        return hash
-    }
-
-    /** `chr(97 + hash % 26) + (hash >>> 5).toString(36)`, over the hash's unsigned 32 bits. */
-    private fun encode(hash: Int): String {
-        val unsigned = hash.toLong() and 0xFFFFFFFFL
-        return ('a' + (unsigned % 26).toInt()) + (unsigned shr 5).toString(36)
     }
 }

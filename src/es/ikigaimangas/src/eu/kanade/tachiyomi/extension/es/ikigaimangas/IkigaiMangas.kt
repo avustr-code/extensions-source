@@ -112,7 +112,6 @@ abstract class IkigaiMangas :
         set("Sec-Fetch-Dest", "document")
         set("Sec-Fetch-Mode", "navigate")
         set("Sec-Fetch-Site", "cross-site")
-        set("Sec-Fetch-User", "?1")
     }
 
     private val dateFormat = DateTimeFormatter.ofPattern("EEE MMM dd yyyy HH:mm:ss 'GMT'Z", Locale.ENGLISH)
@@ -197,12 +196,12 @@ abstract class IkigaiMangas :
 
         searchUrl.addQueryParameter("pagina", page.toString())
 
-        val document = client.get(searchUrl.build().toString(), headers).asJsoup()
+        val document = client.get(searchUrl.build(), headers).asJsoup()
 
         val mangaList = document.select("section[aria-labelledby=archive-heading] > ul.grid a.card").map { element ->
             SManga.create().apply {
                 thumbnail_url = element.selectFirst("img")?.attr("abs:src")
-                title = element.selectFirst(".card-body .card-title")!!.text()
+                title = element.selectFirst("h3")!!.text()
                 url = element.attr("href").substringAfterLast("/series/").substringBefore("/")
             }
         }
@@ -264,7 +263,7 @@ abstract class IkigaiMangas :
         val mainContent = document.selectFirst("main")!!
         val updatedManga = SManga.create().apply {
             title = mainContent.selectFirst(".card-body .card-title")!!.text()
-            thumbnail_url = mainContent.selectFirst("img")?.attr("abs:src")
+            thumbnail_url = mainContent.selectFirst("article.card figure > img")?.attr("abs:src")
             description = mainContent.selectFirst(".card-body > p")?.text()
             status = parseStatus(mainContent.selectFirst("figure > ul a[href*=?estados]")?.text())
             genre = mainContent.select(".card-body > ul > li > a[href*=?generos]").joinToString { it.text().trim() }
@@ -344,6 +343,12 @@ abstract class IkigaiMangas :
             Page(i, imageUrl = element.attr("abs:src"))
         }
     }
+
+    override fun imageRequest(page: Page): Request = super.imageRequest(page).newBuilder()
+        .header("Sec-Fetch-Dest", "image")
+        .header("Sec-Fetch-Mode", "no-cors")
+        .header("Sec-Fetch-Site", "cross-site")
+        .build()
 
     override fun getFilterList(data: JsonElement?) = FilterList(
         Filter.Header("Nota: Los filtros son ignorados si se realiza una búsqueda por texto."),

@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Wolf.com"
-    versionCode = 6
+    versionCode = 0
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -14,7 +14,7 @@ keiyoushi {
         name = "늑대닷컴 - 웹툰"
         lang = "ko"
         baseUrl {
-            custom("https://wfwf426.com")
+            custom("https://wfwf507.com")
         }
     }
 
@@ -22,7 +22,15 @@ keiyoushi {
         name = "늑대닷컴 - 만화책"
         lang = "ko"
         baseUrl {
-            custom("https://wfwf426.com")
+            custom("https://wfwf507.com")
+        }
+    }
+
+    source {
+        name = "늑대닷컴 - 포토툰"
+        lang = "ko"
+        baseUrl {
+            custom("https://wfwf507.com")
         }
     }
 }

@@ -42,7 +42,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE=$(git merge-base origin/main upstream/main)
+          # Reference point: the upstream commit this fork was last synced to, recorded in
+          # .github/sync-base-sha. merge-base cannot be used here: this fork never merges
+          # upstream, so merge-base stays pinned to the fork point and every file a previous
+          # sync copied from upstream would look like a local edit, blocking all later syncs.
+          if [ -f .github/sync-base-sha ] && git cat-file -e "$(cat .github/sync-base-sha)^{commit}" 2>/dev/null; then
+            BASE=$(cat .github/sync-base-sha)
+          else
+            BASE=$(git merge-base origin/main upstream/main)
+            echo "No usable sync-base-sha, falling back to merge-base."
+          fi
           echo "Common base: $BASE"
 
           # Files this fork changed since the common base.
@@ -56,7 +65,7 @@ jobs:
 
           # Extensions kept in sync with upstream verbatim: always take upstream's version,
           # even if this fork previously touched the same path.
-          forced_sync_prefixes=("src/ko/goodtoon/" "src/ko/newxtoon/" "src/all/manhuarm/")
+          forced_sync_prefixes=("src/ko/goodtoon/" "src/ko/newxtoon/")
 
           while read -r status path extra; do
             [ -z "$path" ] && continue
@@ -115,6 +124,26 @@ jobs:
           git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/avustr-code/extensions-source.git"
           git commit -m "chore: sync upstream changes ($(date -u +%Y-%m-%d))"
           git push origin main
+
+      - name: Record upstream commit as the new sync reference
+        if: always()
+        run: |
+          git fetch --quiet upstream main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --quiet origin main
+          git show-ref --verify --quiet refs/remotes/origin/main || git update-ref refs/remotes/origin/main origin/main
+          NEW_BASE=$(git rev-parse upstream/main)
+          if [ "$(git show origin/main:.github/sync-base-sha 2>/dev/null || true)" = "$NEW_BASE" ]; then
+            echo "sync-base-sha already current."
+            exit 0
+          fi
+          git checkout origin/main -- .github/sync-base-sha 2>/dev/null || true
+          printf '%s\n' "$NEW_BASE" > .github/sync-base-sha
+          git add .github/sync-base-sha
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -m "ci: record upstream sync reference" || exit 0
+          git push origin HEAD:main
 
       - name: Open report issue on conflicts
         if: ${{ steps.sync.outputs.skipped != '0' && steps.sync.outputs.skipped != '' }}

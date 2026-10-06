@@ -1,8 +1,5 @@
 package eu.kanade.tachiyomi.extension.ko.wolfdotcom
 
-import androidx.preference.EditTextPreference
-import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -14,150 +11,99 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
-import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
 import keiyoushi.utils.toJsonString
-import keiyoushi.utils.tryParse
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import keiyoushi.utils.tryParseDate
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.OkHttpClient
+import org.jsoup.nodes.Document
 import java.net.URLEncoder
-import java.text.SimpleDateFormat
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 @Source
-abstract class Wolf :
-    KeiSource(),
-    ConfigurableSource {
+abstract class Wolf : KeiSource() {
 
-    // Source type is determined by the source name suffix.
     private val isWebtoon get() = name.endsWith("웹툰")
     private val isComic get() = name.endsWith("만화책")
+    private val isPhoto get() = name.endsWith("포토툰")
 
-    // Site path segments differ between webtoon and comic sources.
-    private val browsePath get() = if (isComic) "cm" else "ing"
-    private val entryPath get() = if (isComic) "cl" else "list"
-    private val readerPath get() = if (isComic) "cv" else "view"
-
-    override val supportsLatest = true
-
-    override fun OkHttpClient.Builder.configureClient() = this
-
-    // Telegram channel listing the current site address.
-    private val preferences by getPreferencesLazy()
-    private val telegramUrlPref by lazy {
-        preferences.getString("telegram_url", DEFAULT_TELEGRAM_URL) ?: DEFAULT_TELEGRAM_URL
+    private val browsePath get() = when {
+        isComic -> "cm"
+        isPhoto -> "pt"
+        else -> "ing" // Webtoon
     }
 
-    private val domainRegex = Regex("""https://wfwf\d+\.com""")
-
-    @Volatile
-    private var resolvedBaseUrl: String? = null
-
-    // Fetch the Telegram channel once per run to find the current site domain,
-    // falling back to the static baseUrl when the channel is unreachable.
-    // If the resolved domain differs from the one stored in the extension
-    // settings, update the "Custom base URL" preference so the settings screen
-    // reflects the current address.
-    private suspend fun currentBaseUrl(): String {
-        resolvedBaseUrl?.let { return it }
-        val resolved = runCatching {
-            val document = client.get(telegramUrlPref.toHttpUrl()).asJsoup()
-            document.select("a[href]").mapNotNull { el -> el.attr("abs:href") }
-                .firstOrNull { domainRegex.containsMatchIn(it) }
-                ?: domainRegex.find(document.text())?.value
-        }.getOrNull()
-
-        if (resolved != null && resolved != baseUrl) {
-            preferences.edit().putString("overrideBaseUrl", resolved).apply()
-        }
-
-        return (resolved ?: baseUrl).also { resolvedBaseUrl = it }
+    private val entryPath get() = when {
+        isComic -> "cl"
+        else -> "list"
     }
 
-    // Popular = sort by "f" (인기순)
-    override suspend fun getPopularManga(page: Int): MangasPage = getSearchMangaList(page, "", POPULAR)
+    private val readerPath get() = when {
+        isComic -> "cv"
+        else -> "view"
+    }
 
-    // Latest = sort by "n" (최신순)
-    override suspend fun getLatestUpdates(page: Int): MangasPage = getSearchMangaList(page, "", LATEST)
+    private val sortOptions get() = if (isComic) {
+        listOf("최신순" to "n", "인기순" to "f")
+    } else {
+        listOf("최신순" to "n", "신작순" to "r", "인기순" to "f")
+    }
 
-    override suspend fun getSearchMangaList(
-        page: Int,
-        query: String,
-        filters: FilterList,
-    ): MangasPage {
-        if (query.isNotBlank()) {
-            return querySearch(query)
-        }
+    // ============================== Popular ==============================
 
-        val pageUrl = "${currentBaseUrl()}/$browsePath".toHttpUrl().newBuilder().apply {
-            filters.filterIsInstance<UrlPartFilter>().forEach { filter ->
-                filter.addToUrl(this)
+    override suspend fun getPopularManga(page: Int): MangasPage = getSearchMangaList(page, "", FilterList(SortFilter(sortOptions, "f")))
+
+    // ============================== Latest ===============================
+
+    override suspend fun getLatestUpdates(page: Int): MangasPage = getSearchMangaList(page, "", FilterList(SortFilter(sortOptions, "n")))
+
+    // ============================== Search ===============================
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = if (query.isNotBlank()) {
+            if (query.length < 2) {
+                throw Exception("두 글자 이상 입력 해주세요.")
             }
-            addQueryParameter("pg", page.toString())
-        }.build()
-
-        val document = client.get(pageUrl).asJsoup()
-
-        val entries = document.select("a.t-card")
-            .filter { card -> card.absUrl("href").contains("toon=") }
-            .map { card ->
-                val id = card.absUrl("href").toHttpUrl().queryParameter("toon")!!
-                SManga.create().apply {
-                    url = "/$entryPath?toon=$id"
-                    title = card.selectFirst(".t-title")!!.text()
-                    thumbnail_url = portraitCover(card.selectFirst(".t-img img")?.absUrl("src"))
+            "$baseUrl/sh".toHttpUrl().newBuilder()
+                .addEncodedQueryParameter("q", URLEncoder.encode(query.trim(), "EUC-KR"))
+        } else {
+            val path = if (isWebtoon && filters.firstInstanceOrNull<StatusFilter>()?.state == 1) "end" else browsePath
+            "$baseUrl/$path".toHttpUrl().newBuilder().apply {
+                filters.filterIsInstance<UrlPartFilter>().forEach { filter ->
+                    filter.addToUrl(this)
                 }
             }
-
-        val hasNext = entries.isNotEmpty() && hasNextPageLink(document)
-
-        return MangasPage(entries, hasNext)
-    }
-
-    private fun hasNextPageLink(document: org.jsoup.nodes.Document): Boolean {
-        // The next-page arrow is the last .pg-btn inside div.pagi.
-        // On browse pages it has class "pg-btn arr"; on detail pages just "pg-btn".
-        // When there is no next page it is a <span> with no href.
-        val arrow = document.selectFirst("div.pagi > .pg-btn:last-child") ?: return false
-        return arrow.tagName() == "a" && arrow.hasAttr("href")
-    }
-
-    // Strip non-Korean/alphanumeric characters from the search query.
-    private val specialChars = Regex("""[^\p{InHangul_Syllables}0-9a-z ]""", RegexOption.IGNORE_CASE)
-
-    // The site's covers are 2:1 landscape banners; use them as-is for the
-    // best available resolution (mihon crops them with ContentScale.Crop).
-    private fun portraitCover(url: String?): String? = url
-
-    private suspend fun querySearch(query: String): MangasPage {
-        if (query.length < 2) {
-            throw Exception("두 글자 이상 입력 해주세요.")
         }
-        val stdQuery = query.replace(specialChars, "")
-        // The site uses EUC-KR charset, so the query must be EUC-KR encoded.
-        val searchUrl = "${currentBaseUrl()}/sh?q=${URLEncoder.encode(stdQuery, "EUC-KR")}".toHttpUrl()
+            .addQueryParameter("pg", page.toString())
+            .build()
 
-        val document = client.get(searchUrl).asJsoup()
-
-        // Keep only cards that belong to this source type.
-        val entries = document.select("a.t-card")
-            .filter { card -> card.absUrl("href").contains("/$entryPath?toon=") }
-            .map { card ->
-                val id = card.absUrl("href").toHttpUrl().queryParameter("toon")!!
-                SManga.create().apply {
-                    url = "/$entryPath?toon=$id"
-                    title = card.selectFirst(".t-title")!!.text()
-                    thumbnail_url = portraitCover(card.selectFirst(".t-img img")?.absUrl("src"))
-                }
-            }
-
-        return MangasPage(entries, false)
+        return parseMangaList(client.get(url).asJsoup())
     }
+
+    private fun parseMangaList(document: Document): MangasPage {
+        val mangas = document.select("a.t-card[href*=/$entryPath?]").map { el ->
+            SManga.create().apply {
+                url = el.absUrl("href").toHttpUrl().queryParameter("toon")!!
+                title = el.selectFirst(".t-title")!!.text()
+                thumbnail_url = el.selectFirst(".t-img img")?.absUrl("src")
+            }
+        }
+
+        return MangasPage(mangas, document.hasNextPage())
+    }
+
+    private fun Document.hasNextPage() = selectFirst(".pagi .pg-btn.on + a.pg-btn") != null
+
+    // ============================== Details ==============================
+
+    override fun getMangaUrl(manga: SManga): String = baseUrl.toHttpUrl().newBuilder()
+        .addPathSegment(entryPath)
+        .addQueryParameter("toon", manga.url)
+        .toString()
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -165,49 +111,21 @@ abstract class Wolf :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val (manga, chapters) = coroutineScope {
-            val mangaD = async { if (fetchDetails) getMangaDetails(manga) else manga }
-            val chaptersD = async { if (fetchChapters) getChapterList(manga) else chapters }
-            mangaD.await() to chaptersD.await()
-        }
+        var document = client.get(getMangaUrl(manga)).asJsoup()
 
-        return SMangaUpdate(manga, chapters)
-    }
-
-    private suspend fun getMangaDetails(manga: SManga): SManga {
-        val document = client.get((currentBaseUrl() + manga.url).toHttpUrl()).asJsoup()
-
-        return SManga.create().apply {
-            url = manga.url
+        val updatedManga = manga.apply {
             title = document.selectFirst("h1.w-title")!!.text()
-            thumbnail_url = portraitCover(document.selectFirst(".thumb-wrap img")?.absUrl("src"))
+            thumbnail_url = document.selectFirst(".thumb-wrap img")?.absUrl("src")
             description = document.selectFirst(".summary")?.text()
-            genre = document.select("a.gtag")
-                .joinToString(", ") { it.text().removePrefix("#") }
-                .ifEmpty { null }
-            author = document.selectFirst(".w-author")?.text()
-            initialized = true
+            genre = document.select(".genre-tags a.gtag").joinToString { it.text().removePrefix("#") }
         }
-    }
 
-    // Encoded chapter URL (toon + num) so the reader URL can be rebuilt.
-    @Serializable
-    class ChapterUrl(
-        val toon: String,
-        val num: String,
-    )
+        if (!fetchChapters) return SMangaUpdate(updatedManga, chapters)
 
-    // Walk all pages of the detail page to collect the full chapter list.
-    private suspend fun getChapterList(manga: SManga): List<SChapter> {
-        val entries = mutableListOf<SChapter>()
+        val updatedChapters = mutableListOf<SChapter>()
         var page = 1
         while (true) {
-            val pageUrl = (currentBaseUrl() + manga.url).toHttpUrl().newBuilder().apply {
-                addQueryParameter("pg", page.toString())
-            }.build()
-
-            val document = client.get(pageUrl).asJsoup()
-            val pageChapters = document.select("a.ep-item").map { el ->
+            document.select("a.ep-item").mapTo(updatedChapters) { el ->
                 val chapUrl = el.absUrl("href").toHttpUrl()
                 SChapter.create().apply {
                     url = ChapterUrl(
@@ -215,80 +133,90 @@ abstract class Wolf :
                         chapUrl.queryParameter("num")!!,
                     ).toJsonString()
                     name = el.selectFirst(".ep-title")!!.text()
-                    date_upload = dateFormat.tryParse(el.selectFirst(".ep-date")?.text())
+                    date_upload = dateFormat.tryParseDate(el.selectFirst(".ep-date")?.text())
                 }
             }
+            if (!document.hasNextPage()) break
 
-            if (pageChapters.isEmpty()) break
-            entries.addAll(pageChapters)
-
-            if (!hasNextPageLink(document)) break
             page++
+            val url = getMangaUrl(manga).toHttpUrl().newBuilder()
+                .addQueryParameter("s", "n")
+                .addQueryParameter("pg", page.toString())
+                .build()
+            document = client.get(url).asJsoup()
         }
 
-        return entries
+        return SMangaUpdate(updatedManga, updatedChapters)
     }
 
-    // Rebuild the reader URL from the encoded ChapterUrl JSON.
+    // ============================= Chapters ==============================
+
+    @Serializable
+    class ChapterUrl(
+        val toon: String,
+        val num: String,
+    )
+
     override fun getChapterUrl(chapter: SChapter): String {
         val chapUrl = chapter.url.parseAs<ChapterUrl>()
-        return "${resolvedBaseUrl ?: baseUrl}/$readerPath?toon=${chapUrl.toon}&num=${chapUrl.num}"
+
+        return baseUrl.toHttpUrl().newBuilder()
+            .addPathSegment(readerPath)
+            .addQueryParameter("toon", chapUrl.toon)
+            .addQueryParameter("num", chapUrl.num)
+            .toString()
     }
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val document = client.get(getChapterUrl(chapter).toHttpUrl()).asJsoup()
+    // =============================== Pages ===============================
 
-        // Images use data-src (lazy loading) inside the viewer area.
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val document = client.get(getChapterUrl(chapter)).asJsoup()
+
         return document.select("#vimg-area img[data-src]").mapIndexed { idx, img ->
             Page(idx, imageUrl = img.absUrl("data-src"))
         }
     }
 
-    // Deeplink: resolve a site URL to an SManga.
-    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != currentBaseUrl().toHttpUrl().host) return null
+    // ============================== Filters ==============================
 
-        if (url.pathSegments.firstOrNull() != entryPath) return null
-        val toon = url.queryParameter("toon") ?: return null
+    override val supportsFilterFetching get() = !isPhoto
 
-        val manga = SManga.create().apply { this.url = "/$entryPath?toon=$toon" }
-        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false)
-            .manga
-            .apply { initialized = true }
+    override suspend fun fetchFilterData(): JsonElement {
+        val document = client.get("$baseUrl/$browsePath").asJsoup()
+
+        return document.select(".f-row").mapNotNull { row ->
+            val links = row.select("a.ftag").map { it.ownText() to it.absUrl("href").toHttpUrl() }
+            val param = FILTER_PARAMS.firstOrNull { param ->
+                links.any { !it.second.queryParameter(param).isNullOrEmpty() }
+            } ?: return@mapNotNull null
+
+            FilterRow(
+                param = param,
+                options = links.map { (name, url) -> FilterOption(name, url.queryParameter(param).orEmpty()) },
+            )
+        }.toJsonElement()
     }
 
     override fun getFilterList(data: JsonElement?): FilterList {
+        if (isPhoto) return FilterList()
+
         val filters: MutableList<Filter<*>> = mutableListOf(
-            SortFilter(),
+            Filter.Header("검색어 입력 시 필터는 무시됩니다"),
+            SortFilter(sortOptions),
         )
 
-        if (isComic) {
-            filters.add(ComicGenreFilter())
-        } else {
-            filters.add(TypeFilter())
-            filters.add(DayFilter())
-            filters.add(GenreFilter())
+        if (isWebtoon) {
+            filters.add(StatusFilter())
+        }
+
+        data?.parseAs<List<FilterRow>>()?.forEach {
+            filters.add(RowFilter(it))
         }
 
         return FilterList(filters)
     }
-
-    // Let the user override the Telegram channel that lists the current site
-    // address. Falls back to the static baseUrl when it cannot be resolved.
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        EditTextPreference(screen.context).apply {
-            key = "telegram_url"
-            title = "주소 공지 채널"
-            summary = "현재 사이트 주소를 알려주는 텔레그램 채널 URL"
-            setDefaultValue(DEFAULT_TELEGRAM_URL)
-        }.also(screen::addPreference)
-    }
-
-    companion object {
-        private const val DEFAULT_TELEGRAM_URL = "https://t.me/s/wfwf_com"
-
-        private val dateFormat by lazy {
-            SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
-        }
-    }
 }
+
+private val FILTER_PARAMS = listOf("t1", "t2", "t3")
+
+private val dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.ROOT)
