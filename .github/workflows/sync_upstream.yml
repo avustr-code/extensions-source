@@ -132,6 +132,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch --quiet origin main
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/avustr-code/extensions-source.git"
           git show-ref --verify --quiet refs/remotes/origin/main || git update-ref refs/remotes/origin/main origin/main
           NEW_BASE=$(git rev-parse upstream/main)
           if [ "$(git show origin/main:.github/sync-base-sha 2>/dev/null || true)" = "$NEW_BASE" ]; then
@@ -143,7 +144,7 @@ jobs:
           git add .github/sync-base-sha
           git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
             commit -m "ci: record upstream sync reference" || exit 0
-          git push origin HEAD:main
+          git push origin HEAD:main || exit 0
 
       - name: Open report issue on conflicts
         if: ${{ steps.sync.outputs.skipped != '0' && steps.sync.outputs.skipped != '' }}
