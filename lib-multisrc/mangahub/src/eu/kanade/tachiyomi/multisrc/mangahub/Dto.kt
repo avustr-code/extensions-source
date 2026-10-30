@@ -24,14 +24,6 @@ class ChapterCryptoDto(
     val keys: Map<String, String>? = null,
 )
 
-@Serializable
-class ChapterCryptoDto(
-    val keyId: String? = null,
-    val key: String? = null,
-    val expiresAt: Long? = null,
-    val keys: Map<String, String>? = null,
-)
-
 // Search, Popular, Latest
 @Serializable
 class ApiSearchObject(
