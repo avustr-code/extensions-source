@@ -67,6 +67,18 @@ jobs:
           # even if this fork previously touched the same path.
           forced_sync_prefixes=("src/ko/goodtoon/" "src/ko/newxtoon/")
 
+          # Fork-protected paths: NEVER take from upstream, always keep our version.
+          # These are critical for fork-specific build/publish configuration.
+          fork_protected_paths=(
+            ".github/workflows/build_publish.yml"
+            ".github/scripts/generate-build-matrices.py"
+            "src/th/blackmanga/"
+            "src/th/pedmanga/"
+            "src/en/comick/"
+            "src/en/novatoon/"
+            "src/ko/jjaptoon/"
+          )
+
           while read -r status path extra; do
             [ -z "$path" ] && continue
 
@@ -88,6 +100,18 @@ jobs:
                 "$prefix"*) forced=1 ;;
               esac
             done
+
+            # Fork-protected: never let upstream override these paths
+            if [ "$forced" -eq 0 ]; then
+              for protected in "${fork_protected_paths[@]}"; do
+                case "$new_path" in
+                  "$protected"|"$protected"*)
+                    conflicts+=("$new_path [protected]")
+                    continue 2
+                    ;;
+                esac
+              done
+            fi
 
             # Skip if this fork also touched the same path (conflict -> keep ours).
             if [ "$forced" -eq 0 ] && { grep -qx "$new_path" /tmp/ours.txt || { [ -n "$old_path" ] && grep -qx "$old_path" /tmp/ours.txt; }; }; then
