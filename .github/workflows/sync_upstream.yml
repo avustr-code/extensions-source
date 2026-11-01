@@ -172,6 +172,7 @@ jobs:
 
       - name: Open report issue on conflicts
         if: ${{ steps.sync.outputs.skipped != '0' && steps.sync.outputs.skipped != '' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -184,4 +185,4 @@ jobs:
           gh issue create \
             --title "Upstream sync: ${{ steps.sync.outputs.skipped }} file(s) skipped due to conflict" \
             --body "$body" \
-            --label "upstream-sync"
+            --label "upstream-sync" || true
