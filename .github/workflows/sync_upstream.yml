@@ -145,8 +145,163 @@ jobs:
       - name: Commit and push to avustr-code
         if: ${{ steps.sync.outputs.applied != '0' && steps.sync.outputs.applied != '' }}
         run: |
+          set -euo pipefail
           git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/avustr-code/extensions-source.git"
-          git commit -m "chore: sync upstream changes ($(date -u +%Y-%m-%d))"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BASE=$(cat .github/sync-base-sha 2>/dev/null || echo "")
+
+          # Collect all staged files from the sync step
+          mapfile -t STAGED_FILES < <(git diff --cached --name-only | grep -v '^$' || true)
+
+          if [ ${#STAGED_FILES[@]} -eq 0 ]; then
+            echo "Nothing staged to commit."
+            exit 0
+          fi
+
+          # Group files by module/multisrc/lib/src
+          declare -A GROUP_FILES
+          declare -A GROUP_KEY
+
+          for f in "${STAGED_FILES[@]}"; do
+            key=""
+            case "$f" in
+              lib-multisrc/*/*)
+                # lib-multisrc/<name>/...
+                name=$(echo "$f" | cut -d/ -f2)
+                key="multisrc:$name"
+                ;;
+              src/*/*/*)
+                # src/<lang>/<extension>/...
+                lang=$(echo "$f" | cut -d/ -f2)
+                ext=$(echo "$f" | cut -d/ -f3)
+                key="src:$lang:$ext"
+                ;;
+              lib/*/*)
+                # lib/<name>/...
+                name=$(echo "$f" | cut -d/ -f2)
+                key="lib:$name"
+                ;;
+              core/*)
+                key="core"
+                ;;
+              common/*)
+                key="common"
+                ;;
+              compiler/*)
+                key="compiler"
+                ;;
+              gradle/*|build.gradle.kts|gradle.properties|settings.gradle.kts|gradlew*|*.gradle*)
+                key="build"
+                ;;
+              .github/*)
+                # Should be skipped by protection, but just in case group separately
+                key="ci"
+                ;;
+              *)
+                key="other"
+                ;;
+            esac
+            GROUP_FILES["$key"]+="$f"$'\n'
+            GROUP_KEY["$key"]=1
+          done
+
+          # Commit each group separately (deterministic order)
+          for key in $(printf '%s\n' "${!GROUP_KEY[@]}" | sort); do
+            files_str="${GROUP_FILES[$key]}"
+            # Skip empty
+            [ -z "$(echo "$files_str" | grep -v '^$' || true)" ] && continue
+
+            # Build array
+            mapfile -t gfiles < <(echo "$files_str" | grep -v '^$')
+
+            # Unstage everything, then stage only this group
+            git reset -q HEAD -- . 2>/dev/null || true
+
+            for gf in "${gfiles[@]}"; do
+              git add -- "$gf" 2>/dev/null || true
+            done
+
+            # Skip if nothing staged for this group
+            if git diff --cached --quiet; then
+              continue
+            fi
+
+            # Determine commit message
+            cmsg=""
+            case "$key" in
+              multisrc:*)
+                name=$(echo "$key" | cut -d: -f2)
+                # Try to get upstream commit message for these files
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                if [ -n "$upstream_msg" ]; then
+                  # Use upstream message as-is if it already mentions the module, else prefix
+                  if echo "$upstream_msg" | grep -qi "^$name:"; then
+                    cmsg="$upstream_msg"
+                  else
+                    cmsg="$name: $upstream_msg"
+                  fi
+                else
+                  cmsg="$name: sync upstream changes"
+                fi
+                ;;
+              src:*)
+                lang=$(echo "$key" | cut -d: -f2)
+                ext=$(echo "$key" | cut -d: -f3)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                if [ -n "$upstream_msg" ]; then
+                  if echo "$upstream_msg" | grep -qi "^$ext:"; then
+                    cmsg="$upstream_msg"
+                  else
+                    cmsg="$ext: $upstream_msg"
+                  fi
+                else
+                  cmsg="$ext: sync upstream changes"
+                fi
+                ;;
+              lib:*)
+                name=$(echo "$key" | cut -d: -f2)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                if [ -n "$upstream_msg" ]; then
+                  if echo "$upstream_msg" | grep -qi "^$name:"; then
+                    cmsg="$upstream_msg"
+                  else
+                    cmsg="$name: $upstream_msg"
+                  fi
+                else
+                  cmsg="$name: sync upstream changes"
+                fi
+                ;;
+              core)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                cmsg="${upstream_msg:-core: sync upstream changes}"
+                ;;
+              common)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                cmsg="${upstream_msg:-common: sync upstream changes}"
+                ;;
+              compiler)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                cmsg="${upstream_msg:-compiler: sync upstream changes}"
+                ;;
+              build)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                cmsg="${upstream_msg:-build: sync upstream changes}"
+                ;;
+              ci)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                cmsg="${upstream_msg:-ci: sync upstream changes}"
+                ;;
+              other)
+                upstream_msg=$(git log -1 --format='%s' upstream/main -- "${gfiles[@]}" 2>/dev/null | head -1 || true)
+                cmsg="${upstream_msg:-chore: sync upstream changes}"
+                ;;
+            esac
+
+            git commit -m "$cmsg" || true
+          done
+
           git push origin main
 
       - name: Record upstream commit as the new sync reference
