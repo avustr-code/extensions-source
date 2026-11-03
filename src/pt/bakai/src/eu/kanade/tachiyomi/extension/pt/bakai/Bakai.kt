@@ -114,7 +114,8 @@ abstract class Bakai : KeiSource() {
             title = document.selectFirst("h1")?.text() ?: title
             thumbnail_url = document.selectFirst(".mangaInfoBox__cover img")?.attr("abs:src")
             author = info("Artista").joinToString().ifEmpty { null }
-            genre = (info("Tipo") + info("Cor") + info("Parody") + document.select(".mangaGenres__item a").map { it.text() })
+            // Some tags are hidden from guests and show a login prompt in place of the tag name
+            genre = (info("Tipo") + info("Cor") + info("Parody") + document.select(".mangaGenres__item:not(:has(a[href*=/login/])) a").map { it.text() })
                 .distinct()
                 .joinToString()
             description = document.selectFirst("article:not(.ipsEntry) div[data-role=commentContent]")?.text()?.takeIf { it != "-" }
@@ -144,9 +145,9 @@ abstract class Bakai : KeiSource() {
         val document = client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup()
 
         // The reader image class has been renamed several times
-        // (mangaReaderImage -> mangaReaderImaage -> mangaReaderV2Image),
-        // so match the stable prefix instead of the exact class.
-        return document.select("img[class*=mangaReader]").mapIndexed { i, img ->
+        // (mangaReaderImage -> mangaReaderImaage -> mangaReaderV2Image -> mangaV2ReaderImage),
+        // so match the common "Reader" part instead of the exact class.
+        return document.select("img[class*=Reader]").mapIndexed { i, img ->
             val url = img.attr("abs:data-src").ifEmpty { img.attr("abs:src") }
             Page(i, imageUrl = url)
         }
